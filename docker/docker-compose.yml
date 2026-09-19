@@ -1,0 +1,32 @@
+# Run from Linux (or WSL2 with WSLg):
+#     cd docker && docker compose run --rm crc
+# Inside the container:
+#     build && source /ws_build/install/setup.bash
+#     ros2 launch crc_sim sim.launch.py
+services:
+  crc:
+    build: .
+    image: crc_sim:humble
+    stdin_open: true
+    tty: true
+    network_mode: host
+    ipc: host
+    environment:
+      - DISPLAY=${DISPLAY}
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY}
+      - XDG_RUNTIME_DIR=/tmp/runtime
+      - PULSE_SERVER=${PULSE_SERVER}
+      - QT_X11_NO_MITSHM=1
+      - LIBGL_ALWAYS_SOFTWARE=0
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /mnt/wslg:/mnt/wslg:rw
+      - ../src:/ws/src:rw
+      - ../scripts:/ws/scripts:rw
+      - crc_build:/ws_build
+volumes:
+  # Pin the name. Compose otherwise prefixes it with the directory name and
+  # builds into a different tree from scripts/run_docker.sh, so a workspace
+  # compiled with one is invisible to the other.
+  crc_build:
+    name: crc_build

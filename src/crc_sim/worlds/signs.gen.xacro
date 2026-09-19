@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<!-- ==================================================================
+     Traffic sign positions for the practice track.
+     Generated from the official track drawing by the Organising Committee.
+     The graded track uses different types and positions.
+     ================================================================== -->
+<root xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:sign nm="sign_crosswalk" kind="crosswalk" px="0.4000" py="-1.9500" yaw="3.141593"/>
+  <xacro:sign nm="sign_hw_entry" kind="hw_entry" px="0.0000" py="1.9500" yaw="0.000000"/>
+  <xacro:sign nm="sign_hw_exit" kind="hw_exit" px="-3.1000" py="1.9500" yaw="0.000000"/>
+  <xacro:sign nm="sign_bus" kind="bus" px="1.2500" py="-0.0350" yaw="3.141593"/>
+  <xacro:sign nm="sign_ramp" kind="ramp" px="1.3000" py="-1.9500" yaw="3.141593"/>
+  <xacro:sign nm="sign_tunnel" kind="tunnel" px="2.8500" py="-1.9500" yaw="3.141593"/>
+  <xacro:sign nm="sign_uneven" kind="uneven" px="4.9500" py="0.9000" yaw="-1.570796"/>
+  <xacro:sign nm="sign_stop_j51s" kind="stop" px="0.9500" py="1.0500" yaw="-1.570796"/>
+  <xacro:sign nm="sign_stop_j51e" kind="stop" px="0.9500" py="1.9500" yaw="0.000000"/>
+  <xacro:sign nm="sign_stop_j82n" kind="stop" px="3.0500" py="0.9500" yaw="1.570796"/>
+  <xacro:sign nm="sign_stop_j24w" kind="stop" px="-2.9500" py="-1.9500" yaw="3.141593"/>
+  <xacro:sign nm="sign_stop_j44n" kind="stop" px="-0.9500" py="-1.0500" yaw="1.570796"/>
+
+</root>

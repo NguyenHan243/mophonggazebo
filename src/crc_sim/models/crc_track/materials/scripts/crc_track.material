@@ -1,0 +1,22 @@
+material CRC/Track
+{
+  receive_shadows off
+
+  technique
+  {
+    pass
+    {
+      ambient  1.0 1.0 1.0 1.0
+      diffuse  1.0 1.0 1.0 1.0
+      specular 0.0 0.0 0.0 1.0 0.0
+      emissive 0.35 0.35 0.35 1.0
+
+      texture_unit
+      {
+        texture crc_track.png
+        filtering trilinear
+        max_anisotropy 8
+      }
+    }
+  }
+}

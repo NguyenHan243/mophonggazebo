@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<!-- ==================================================================
+     Traffic light positions for the practice track.
+     Generated from the official track drawing by the Organising Committee.
+     The graded track uses a different set.
+     ================================================================== -->
+<root xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:traffic_light nm="tl_j44_w" px="-0.9500" py="-1.9500" yaw="3.141593"/>
+  <xacro:glow nm="tl_j44_w" cl="Red"/>
+  <xacro:glow nm="tl_j44_w" cl="Yellow"/>
+  <xacro:glow nm="tl_j44_w" cl="Green"/>
+
+</root>

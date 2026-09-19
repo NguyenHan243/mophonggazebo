@@ -1,0 +1,159 @@
+material CRC/Sign_stop
+{
+  receive_shadows off
+  technique
+  {
+    pass
+    {
+      ambient  1.0 1.0 1.0 1.0
+      diffuse  1.0 1.0 1.0 1.0
+      specular 0.0 0.0 0.0 1.0 0.0
+      emissive 0.30 0.30 0.30 1.0
+      texture_unit
+      {
+        texture sign_stop.png
+        filtering trilinear
+      }
+    }
+  }
+}
+
+material CRC/Sign_crosswalk
+{
+  receive_shadows off
+  technique
+  {
+    pass
+    {
+      ambient  1.0 1.0 1.0 1.0
+      diffuse  1.0 1.0 1.0 1.0
+      specular 0.0 0.0 0.0 1.0 0.0
+      emissive 0.30 0.30 0.30 1.0
+      texture_unit
+      {
+        texture sign_crosswalk.png
+        filtering trilinear
+      }
+    }
+  }
+}
+
+material CRC/Sign_bus
+{
+  receive_shadows off
+  technique
+  {
+    pass
+    {
+      ambient  1.0 1.0 1.0 1.0
+      diffuse  1.0 1.0 1.0 1.0
+      specular 0.0 0.0 0.0 1.0 0.0
+      emissive 0.30 0.30 0.30 1.0
+      texture_unit
+      {
+        texture sign_bus.png
+        filtering trilinear
+      }
+    }
+  }
+}
+
+material CRC/Sign_hw_entry
+{
+  receive_shadows off
+  technique
+  {
+    pass
+    {
+      ambient  1.0 1.0 1.0 1.0
+      diffuse  1.0 1.0 1.0 1.0
+      specular 0.0 0.0 0.0 1.0 0.0
+      emissive 0.30 0.30 0.30 1.0
+      texture_unit
+      {
+        texture sign_hw_entry.png
+        filtering trilinear
+      }
+    }
+  }
+}
+
+material CRC/Sign_hw_exit
+{
+  receive_shadows off
+  technique
+  {
+    pass
+    {
+      ambient  1.0 1.0 1.0 1.0
+      diffuse  1.0 1.0 1.0 1.0
+      specular 0.0 0.0 0.0 1.0 0.0
+      emissive 0.30 0.30 0.30 1.0
+      texture_unit
+      {
+        texture sign_hw_exit.png
+        filtering trilinear
+      }
+    }
+  }
+}
+
+material CRC/Sign_ramp
+{
+  receive_shadows off
+  technique
+  {
+    pass
+    {
+      ambient  1.0 1.0 1.0 1.0
+      diffuse  1.0 1.0 1.0 1.0
+      specular 0.0 0.0 0.0 1.0 0.0
+      emissive 0.30 0.30 0.30 1.0
+      texture_unit
+      {
+        texture sign_ramp.png
+        filtering trilinear
+      }
+    }
+  }
+}
+
+material CRC/Sign_tunnel
+{
+  receive_shadows off
+  technique
+  {
+    pass
+    {
+      ambient  1.0 1.0 1.0 1.0
+      diffuse  1.0 1.0 1.0 1.0
+      specular 0.0 0.0 0.0 1.0 0.0
+      emissive 0.30 0.30 0.30 1.0
+      texture_unit
+      {
+        texture sign_tunnel.png
+        filtering trilinear
+      }
+    }
+  }
+}
+
+material CRC/Sign_uneven
+{
+  receive_shadows off
+  technique
+  {
+    pass
+    {
+      ambient  1.0 1.0 1.0 1.0
+      diffuse  1.0 1.0 1.0 1.0
+      specular 0.0 0.0 0.0 1.0 0.0
+      emissive 0.30 0.30 0.30 1.0
+      texture_unit
+      {
+        texture sign_uneven.png
+        filtering trilinear
+      }
+    }
+  }
+}

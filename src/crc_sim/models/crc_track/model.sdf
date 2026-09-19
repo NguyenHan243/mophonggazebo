@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<!--
+  Stand-alone model, for <include> from another world.
+  crc_track.world.xacro does NOT use this file: it declares the link
+  directly so the board size can be changed with the track_scale argument.
+  Default size: 10.00 x 6.00 m, top surface at z = 0.
+-->
+<sdf version="1.6">
+  <model name="crc_track">
+    <static>true</static>
+    <link name="link">
+      <collision name="collision">
+        <pose>0 0 -0.01 0 0 0</pose>
+        <geometry><box><size>10.0 6.0 0.02</size></box></geometry>
+        <surface>
+          <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+        </surface>
+      </collision>
+      <visual name="visual">
+        <pose>0 0 -0.01 0 0 0</pose>
+        <cast_shadows>false</cast_shadows>
+        <geometry><box><size>10.0 6.0 0.02</size></box></geometry>
+        <material>
+          <script>
+            <uri>model://crc_track/materials/scripts</uri>
+            <uri>model://crc_track/materials/textures</uri>
+            <name>CRC/Track</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

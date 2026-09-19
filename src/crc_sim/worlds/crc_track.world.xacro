@@ -1,0 +1,462 @@
+<?xml version="1.0"?>
+<!--
+  Gazebo Classic world for UEH CRC 2026.
+  Processed by xacro at launch time (sim.launch.py) so the board size can be
+  changed through the track_scale argument.
+
+  Coordinate frame: origin (0,0) at the CENTRE of the board, +X to the right,
+  +Y upwards (as seen on the texture), board surface at z = 0.
+      board(x_b, y_b) [top-left origin, y down]  ->  world(x_b - W/2 , H/2 - y_b)
+-->
+<sdf version="1.6" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:arg name="track_w" default="10.0"/>
+  <xacro:arg name="track_h" default="6.0"/>
+  <xacro:arg name="props"   default="true"/>
+  <xacro:arg name="skycam"  default="true"/>
+  <xacro:arg name="lights"  default="true"/>
+  <xacro:arg name="signs"   default="true"/>
+  <!-- Wall segment length on the tunnel curve.
+       0.13 = GAPS      -> light leaks in as stripes, alternating light/dark.
+       0.20 = SEALED    -> fully dark tunnel (outer wall chord is 0.171). -->
+  <xacro:arg name="tunnel_seg" default="0.13"/>
+
+  <!-- Where the TurtleBot3 meshes live, so the parked vehicle can reuse the
+       same body the robot uses. The launch file passes an absolute file://
+       path; see the note on GAZEBO_MODEL_PATH in sim.launch.py. -->
+  <xacro:arg name="mesh_prefix" default="package://turtlebot3_description"/>
+  <xacro:arg name="use_mesh"    default="true"/>
+
+  <xacro:property name="W"      value="$(arg track_w)"/>
+  <xacro:property name="H"      value="$(arg track_h)"/>
+  <xacro:property name="props"  value="$(arg props)"/>
+  <xacro:property name="skycam" value="$(arg skycam)"/>
+  <xacro:property name="lights" value="$(arg lights)"/>
+  <xacro:property name="signs"  value="$(arg signs)"/>
+  <xacro:property name="tseg"   value="$(arg tunnel_seg)"/>
+  <xacro:property name="mesh"   value="$(arg mesh_prefix)"/>
+  <xacro:property name="use_mesh" value="${'$(arg use_mesh)'.lower() in ('true','1')}"/>
+  <xacro:property name="PI"     value="3.14159265"/>
+
+  <!-- Object positions, expressed as a FRACTION of the board.
+       Taken from the official track drawing (1000 mm cell grid):
+         crosswalk  -> board(5.50, 4.50) m
+         RAMP       -> board(6.00..8.00), centre 7.00
+         TUNNEL 1   -> board(8.50, 4.50)
+         TUNNEL 2   -> board(9.50, 3.50), on the VERTICAL road
+       board -> world:  wx = board_x - 5 ,  wy = 3 - board_y            -->
+  <xacro:property name="ramp_x"  value="${(0.700 - 0.5) * W}"/>
+  <xacro:property name="ramp_y"  value="${(0.5 - 0.750) * H}"/>
+  <xacro:property name="tun1_x"  value="${(0.850 - 0.5) * W}"/>
+  <xacro:property name="tun1_y"  value="${(0.5 - 0.750) * H}"/>
+  <xacro:property name="tun2_x"  value="${(0.950 - 0.5) * W}"/>
+  <xacro:property name="tun2_y"  value="${(0.5 - 0.58333) * H}"/>
+
+
+  <world name="crc_track">
+
+    <!-- Provides the /set_entity_state and /get_entity_state services.
+         The traffic light node uses them to show/hide the glowing lamp
+         spheres. Latency is milliseconds, unlike `gz topic -p` which costs
+         about 2 seconds per call. -->
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros><namespace>/</namespace></ros>
+      <update_rate>1.0</update_rate>
+    </plugin>
+
+    <!-- ============================ SETTINGS ============================= -->
+    <physics name="default_physics" default="true" type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+
+    <scene>
+      <ambient>0.75 0.75 0.75 1</ambient>
+      <background>0.55 0.60 0.68 1</background>
+      <shadows>false</shadows>
+    </scene>
+
+    <light name="sun" type="directional">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 12 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.1 0.1 0.1 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.3 0.3 -0.9</direction>
+    </light>
+
+    <gui fullscreen="0">
+      <camera name="user_camera">
+        <pose>0 -7.5 9.0 0 0.92 1.5708</pose>
+      </camera>
+    </gui>
+
+    <!-- ============================= TRACK =============================== -->
+    <model name="crc_track">
+      <static>true</static>
+      <pose>0 0 0 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <pose>0 0 -0.01 0 0 0</pose>
+          <geometry><box><size>${W} ${H} 0.02</size></box></geometry>
+          <surface>
+            <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <pose>0 0 -0.01 0 0 0</pose>
+          <cast_shadows>false</cast_shadows>
+          <geometry><box><size>${W} ${H} 0.02</size></box></geometry>
+          <material>
+            <script>
+              <uri>model://crc_track/materials/scripts</uri>
+              <uri>model://crc_track/materials/textures</uri>
+              <name>CRC/Track</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ======================= TOP-DOWN CAMERA ==========================
+         Placed at height z = W, so half-width / height = 0.5 for ANY
+         track_scale => hfov = 2*atan(0.5) = 0.9272952 rad and a 1000x600
+         image covers the board exactly.
+         Topic: /sky_cam/image_raw - lets you capture the simulation while
+         running headless (gui:=false), with no Gazebo window.
+    ==================================================================== -->
+    <xacro:if value="${skycam}">
+      <model name="sky_cam">
+        <static>true</static>
+        <pose>0 0 ${W} 0 1.5707963 1.5707963</pose>
+        <link name="link">
+          <sensor name="sky_camera" type="camera">
+            <always_on>true</always_on>
+            <update_rate>5</update_rate>
+            <visualize>false</visualize>
+            <camera name="sky">
+              <horizontal_fov>0.9272952</horizontal_fov>
+              <image>
+                <width>1000</width>
+                <height>600</height>
+                <format>R8G8B8</format>
+              </image>
+              <clip><near>0.1</near><far>100</far></clip>
+            </camera>
+            <plugin name="sky_cam_plugin" filename="libgazebo_ros_camera.so">
+              <ros><namespace>/</namespace></ros>
+              <camera_name>sky_cam</camera_name>
+              <frame_name>sky_cam_link</frame_name>
+            </plugin>
+          </sensor>
+        </link>
+      </model>
+    </xacro:if>
+
+    <!-- ======================= TRAFFIC LIGHTS ===========================
+         Total height 350 mm: 220 pole + 130 lamp housing.
+         The three lamps face the model +X axis; yaw orients that face
+         towards oncoming traffic.
+         Visual names used by the controller node at run time:
+             <ten>::link::lamp_red_v / lamp_yellow_v / lamp_green_v
+    ==================================================================== -->
+    <xacro:if value="${lights}">
+      <xacro:macro name="traffic_light" params="nm px py yaw">
+        <model name="${nm}">
+          <static>true</static>
+          <pose>${px} ${py} 0 0 0 ${yaw}</pose>
+          <link name="link">
+
+            <!-- pole -->
+            <collision name="pole_c">
+              <pose>0 0 0.110 0 0 0</pose>
+              <geometry><cylinder><radius>0.009</radius><length>0.220</length></cylinder></geometry>
+            </collision>
+            <visual name="pole_v">
+              <pose>0 0 0.110 0 0 0</pose>
+              <geometry><cylinder><radius>0.009</radius><length>0.220</length></cylinder></geometry>
+              <material><script><name>Gazebo/DarkGrey</name></script></material>
+            </visual>
+
+            <!-- lamp housing -->
+            <collision name="box_c">
+              <pose>0 0 0.285 0 0 0</pose>
+              <geometry><box><size>0.048 0.058 0.130</size></box></geometry>
+            </collision>
+            <visual name="box_v">
+              <pose>0 0 0.285 0 0 0</pose>
+              <geometry><box><size>0.048 0.058 0.130</size></box></geometry>
+              <material><script><name>Gazebo/FlatBlack</name></script></material>
+            </visual>
+
+            <!-- three lamps: discs facing +X, OFF (black) by default -->
+            <xacro:macro name="lamp" params="cl z">
+              <visual name="lamp_${cl}_v">
+                <pose>0.026 0 ${z} 0 1.5707963 0</pose>
+                <geometry><cylinder><radius>0.018</radius><length>0.008</length></cylinder></geometry>
+                <material><script><name>Gazebo/FlatBlack</name></script></material>
+              </visual>
+            </xacro:macro>
+            <xacro:lamp cl="red"    z="0.325"/>
+            <xacro:lamp cl="yellow" z="0.285"/>
+            <xacro:lamp cl="green"  z="0.245"/>
+
+          </link>
+        </model>
+      </xacro:macro>
+
+      <!-- One glowing sphere per colour. The controller moves the active
+           sphere onto the lamp and pushes the other two down to z = -5
+           (hidden below the board). A SPHERE is used so the result does
+           not depend on how the pole is rotated. -->
+      <xacro:macro name="glow" params="nm cl">
+        <model name="${nm}_glow_${cl}">
+          <pose>0 0 -5 0 0 0</pose>
+          <link name="link">
+            <gravity>0</gravity>
+            <kinematic>true</kinematic>
+            <inertial>
+              <mass>0.001</mass>
+              <inertia><ixx>1e-6</ixx><iyy>1e-6</iyy><izz>1e-6</izz>
+                       <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
+            </inertial>
+            <visual name="v">
+              <geometry><sphere><radius>0.017</radius></sphere></geometry>
+              <material><script><name>Gazebo/${cl}Glow</name></script></material>
+            </visual>
+          </link>
+        </model>
+      </xacro:macro>
+
+      <!-- Traffic light list, generated from the official track drawing. -->
+      <xacro:include filename="lights.gen.xacro"/>
+    </xacro:if>
+
+    <!-- ======================= TRAFFIC SIGNS ============================
+         200 mm pole + 70x70 mm plate -> top at 270 mm.
+         The plate is thin along the model X axis and its printed face
+         points to +X, so yaw is the direction the sign "looks".
+
+         This block sits OUTSIDE the traffic-light block on purpose. It used
+         to be nested inside it, which meant lights:=false silently removed
+         every sign as well.
+    ==================================================================== -->
+    <xacro:if value="${signs}">
+      <xacro:macro name="sign" params="nm kind px py yaw">
+        <model name="${nm}">
+          <static>true</static>
+          <pose>${px} ${py} 0 0 0 ${yaw}</pose>
+          <link name="link">
+            <collision name="pole_c">
+              <pose>0 0 0.100 0 0 0</pose>
+              <geometry><cylinder><radius>0.006</radius><length>0.200</length></cylinder></geometry>
+            </collision>
+            <visual name="pole_v">
+              <pose>0 0 0.100 0 0 0</pose>
+              <geometry><cylinder><radius>0.006</radius><length>0.200</length></cylinder></geometry>
+              <material><script><name>Gazebo/DarkGrey</name></script></material>
+            </visual>
+            <collision name="board_c">
+              <pose>0 0 0.235 0 0 0</pose>
+              <geometry><box><size>0.004 0.070 0.070</size></box></geometry>
+            </collision>
+            <visual name="board_v">
+              <pose>0 0 0.235 0 0 0</pose>
+              <geometry><box><size>0.004 0.070 0.070</size></box></geometry>
+              <material>
+                <script>
+                  <uri>model://crc_signs/materials/scripts</uri>
+                  <uri>model://crc_signs/materials/textures</uri>
+                  <name>CRC/Sign_${kind}</name>
+                </script>
+              </material>
+            </visual>
+          </link>
+        </model>
+      </xacro:macro>
+
+      <xacro:include filename="signs.gen.xacro"/>
+    </xacro:if>
+
+    <!-- ========================= TRACK PROPS ============================= -->
+    <xacro:if value="${props}">
+
+      <!-- ==== RAMP: 2 cells = 2.0 m (up 0.75 / flat 0.5 / down 0.75)
+           50 mm high, slope atan(0.05/0.75) = 0.0666 rad = 3.8 deg      ==== -->
+      <model name="ramp">
+        <static>true</static>
+        <pose>${ramp_x} ${ramp_y} 0 0 0 0</pose>
+        <link name="link">
+          <xacro:macro name="slab" params="nm x z pitch ln">
+            <collision name="${nm}_c">
+              <pose>${x} 0 ${z} 0 ${pitch} 0</pose>
+              <geometry><box><size>${ln} 0.70 0.03</size></box></geometry>
+              <surface><friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction></surface>
+            </collision>
+            <visual name="${nm}_v">
+              <pose>${x} 0 ${z} 0 ${pitch} 0</pose>
+              <geometry><box><size>${ln} 0.70 0.03</size></box></geometry>
+              <material><script><name>Gazebo/Grey</name></script></material>
+            </visual>
+          </xacro:macro>
+          <xacro:slab nm="up"   x="-0.625" z="0.010" pitch="-0.06656" ln="0.7517"/>
+          <xacro:slab nm="top"  x="0"      z="0.035" pitch="0"        ln="0.50"/>
+          <xacro:slab nm="dn"   x="0.625"  z="0.010" pitch="0.06656"  ln="0.7517"/>
+        </link>
+      </model>
+
+      <!-- ==== DARK TUNNEL: two walls + roof, 1 cell = 1.0 m long ==== -->
+      <xacro:macro name="tunnel" params="nm px py yaw ln:=1.00">
+        <model name="${nm}">
+          <static>true</static>
+          <pose>${px} ${py} 0 0 0 ${yaw}</pose>
+          <link name="link">
+            <xacro:macro name="slab2" params="n2 pose2 size2">
+              <collision name="${n2}_c">
+                <pose>${pose2}</pose>
+                <geometry><box><size>${size2}</size></box></geometry>
+              </collision>
+              <visual name="${n2}_v">
+                <pose>${pose2}</pose>
+                <geometry><box><size>${size2}</size></box></geometry>
+                <material><script><name>Gazebo/FlatBlack</name></script></material>
+              </visual>
+            </xacro:macro>
+            <xacro:slab2 n2="wl"   pose2="0  0.37 0.14 0 0 0" size2="${ln} 0.02 0.28"/>
+            <xacro:slab2 n2="wr"   pose2="0 -0.37 0.14 0 0 0" size2="${ln} 0.02 0.28"/>
+            <xacro:slab2 n2="roof" pose2="0  0    0.29 0 0 0" size2="${ln} 0.76 0.02"/>
+          </link>
+        </model>
+      </xacro:macro>
+
+      <xacro:tunnel nm="tunnel_1" px="${tun1_x}" py="${tun1_y}" yaw="0"/>
+      <xacro:tunnel nm="tunnel_2" px="${tun2_x}" py="${tun2_y}" yaw="1.5707963"/>
+
+      <!-- Curved section joining tunnel_1 to tunnel_2, covering the whole
+           bend. Quarter circle centred at (4.0, -1.0), radius 0.5 m, split
+           into 8 straight segments. The chord is 0.098 m on the centreline
+           but 0.171 m on the OUTER wall (radius 0.87), so ln=0.20 is
+           required to close the gaps completely. -->
+      <xacro:tunnel nm="tunnel_arc1" px="4.0490" py="-1.4976" yaw="0.098175" ln="${tseg}"/>
+      <xacro:tunnel nm="tunnel_arc2" px="4.1451" py="-1.4785" yaw="0.294524" ln="${tseg}"/>
+      <xacro:tunnel nm="tunnel_arc3" px="4.2357" py="-1.4410" yaw="0.490874" ln="${tseg}"/>
+      <xacro:tunnel nm="tunnel_arc4" px="4.3172" py="-1.3865" yaw="0.687223" ln="${tseg}"/>
+      <xacro:tunnel nm="tunnel_arc5" px="4.3865" py="-1.3172" yaw="0.883573" ln="${tseg}"/>
+      <xacro:tunnel nm="tunnel_arc6" px="4.4410" py="-1.2357" yaw="1.079922" ln="${tseg}"/>
+      <xacro:tunnel nm="tunnel_arc7" px="4.4785" py="-1.1451" yaw="1.276272" ln="${tseg}"/>
+      <xacro:tunnel nm="tunnel_arc8" px="4.4976" py="-1.0490" yaw="1.472622" ln="${tseg}"/>
+
+
+      <!-- There used to be two loose boxes parked off-road in the top-left
+           corner. They were removed: sitting clear of the road they never
+           blocked anyone, so they added nothing to the task. The parked
+           vehicle on the highway section is the obstacle now. -->
+
+      <!-- ==== PARKED VEHICLE, highway section =========================
+           A second Waffle standing still in the travel lane between the
+           highway entry and exit signs, so overtaking has to be handled.
+
+           Geometry, all measured from the track texture:
+             road          y = 1.145 .. 1.860   (715 mm, two 350 mm lanes)
+             centre line   y = 1.502            (dashed here: passing is legal)
+             travel lane   y = 1.502 .. 1.852   (traffic runs -X, keeps right)
+
+           Parked at y = 1.700, i.e. 23 mm off the lane centre towards the
+           kerb. That small shift matters: at the lane centre the overtaking
+           robot has 48 mm to this vehicle but only 25 mm to the far road
+           edge, and here it gets 48 mm on both sides instead.
+
+           x = -2.10 is plain asphalt; the transverse markings near x = -1.55
+           are avoided on purpose.
+      ============================================================== -->
+      <model name="parked_robot">
+        <static>true</static>
+        <pose>-2.10 1.700 0.010 0 0 ${PI}</pose>
+        <link name="link">
+          <!-- Must reach above the LiDAR. The robot's own scanner sits at
+               z = 0.132 (base_link 0.010 + base_scan 0.122 in the URDF), so a
+               collision box that stops at the base plate is invisible to it:
+               the beam passes straight over and the parked vehicle only exists
+               in the camera image. This spans z = 0.010 .. 0.200. -->
+          <collision name="body_c">
+            <pose>-0.064 0 0.095 0 0 0</pose>
+            <geometry><box><size>0.266 0.266 0.190</size></box></geometry>
+          </collision>
+          <visual name="tower_v">
+            <pose>-0.064 0 0.135 0 0 0</pose>
+            <geometry><cylinder><radius>0.055</radius><length>0.075</length></cylinder></geometry>
+            <material><script><name>Gazebo/DarkGrey</name></script></material>
+          </visual>
+          <visual name="body_v">
+            <pose>-0.064 0 0 0 0 0</pose>
+            <geometry>
+              <xacro:if value="${use_mesh}">
+                <mesh>
+                  <uri>${mesh}/meshes/bases/waffle_base.stl</uri>
+                  <scale>0.001 0.001 0.001</scale>
+                </mesh>
+              </xacro:if>
+              <xacro:unless value="${use_mesh}">
+                <box><size>0.266 0.266 0.094</size></box>
+              </xacro:unless>
+            </geometry>
+            <!-- Deliberately not orange: it must not be mistaken for your own
+                 robot in the camera image. -->
+            <material><script><name>Gazebo/Blue</name></script></material>
+          </visual>
+          <xacro:macro name="parked_wheel" params="nm wy">
+            <visual name="${nm}">
+              <pose>0 ${wy} 0.023 ${PI/2} 0 0</pose>
+              <geometry><cylinder><radius>0.033</radius><length>0.018</length></cylinder></geometry>
+              <material><script><name>Gazebo/FlatBlack</name></script></material>
+            </visual>
+          </xacro:macro>
+          <xacro:parked_wheel nm="wheel_l_v" wy="0.144"/>
+          <xacro:parked_wheel nm="wheel_r_v" wy="-0.144"/>
+        </link>
+      </model>
+
+      <!-- ==== PEDESTRIAN at the crossing ==============================
+           200 mm tall, which is the right size next to a 350 mm lane and a
+           350 mm traffic light. Static, but with collision, so the LiDAR
+           sees it as well as the camera; crc_sim/pedestrian_node.py walks it
+           across using /set_entity_state.
+
+           The zebra stripes run x = 0.72 .. 1.20 on the lower straight, and
+           the road there is y = -1.855 .. -1.140, so it crosses at x = 0.96
+           between the two kerbs.
+
+           Purple and indigo on purpose: never red, yellow or green, which
+           would give a false positive to a traffic-light detector.
+      ============================================================== -->
+      <model name="pedestrian">
+        <static>true</static>
+        <pose>0.96 -1.950 0 0 0 0</pose>
+        <link name="link">
+          <collision name="c">
+            <pose>0 0 0.085 0 0 0</pose>
+            <geometry><cylinder><radius>0.030</radius><length>0.170</length></cylinder></geometry>
+          </collision>
+          <visual name="body_v">
+            <pose>0 0 0.075 0 0 0</pose>
+            <geometry><cylinder><radius>0.028</radius><length>0.150</length></cylinder></geometry>
+            <material><script><name>Gazebo/Purple</name></script></material>
+          </visual>
+          <visual name="head_v">
+            <pose>0 0 0.174 0 0 0</pose>
+            <geometry><sphere><radius>0.026</radius></sphere></geometry>
+            <material><script><name>Gazebo/Indigo</name></script></material>
+          </visual>
+        </link>
+      </model>
+
+    </xacro:if>
+
+  </world>
+</sdf>
