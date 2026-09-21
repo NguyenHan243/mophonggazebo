@@ -40,11 +40,22 @@ class Starter(Node):
         self._last_log = {}
 
         # --------------------------------------------------------------------
-        # BIẾN KHỞI TẠO CHO BỘ LỌC CHỐNG VẠCH NGANG & HẾT LINE
+        # BIẾN ĐIỀU CHỈNH LỆCH LÀN (OFFSET)
         # --------------------------------------------------------------------
-        self.no_line_frame_count = 0  # Bộ đếm số frame liên tiếp không thấy line
-        self.REQUIRED_NO_LINE_FRAMES = 5  # Cần ít nhất 5 frame liên tục để xác nhận hết line
-        self.is_line_ended = False    # Cờ trạng thái đã kích hoạt HẾT LINE
+        self.line_offset = 50
+
+        # --------------------------------------------------------------------
+        # BIẾN QUẢN LÝ TRẠNG THÁI & LEO DỐC / CẦU (RAMP OVERRIDE)
+        # --------------------------------------------------------------------
+        self.no_line_frame_count = 0  # Bộ đếm frame mất line
+        self.REQUIRED_NO_LINE_FRAMES = 12  # Số frame nghi vấn bắt đầu lên cầu
+
+        # Thời gian tối đa (giây) cho phép xe chạy thẳng vượt cầu khi không có line
+        self.RAMP_DRIVE_DURATION = 18.0
+        self.ramp_start_time = None
+        self.is_on_ramp = False
+        self.is_line_ended = False
+        self.target_yaw = None  # Góc hướng ban đầu cần giữ thẳng khi leo cầu
 
         self.bridge = CvBridge() if HAVE_CV else None
 
@@ -108,15 +119,53 @@ class Starter(Node):
             self.get_logger().error(f'control() raised: {e}')
             self.stop()
 
-    # ------------------------------------------------------------------------
-    # THUẬT TOÁN BÁM LÀN - CHỐNG NHẦM VẠCH NGANG & LỌC HẾT LINE
-    # ------------------------------------------------------------------------
-
     def get_line_center_at_row(self, thresh_img, row_y):
-        """Lấy trung điểm x của vạch màu trắng trên một hàng quét chỉ định."""
-        row_pixels = np.where(thresh_img[row_y, :] > 0)[0]
-        if len(row_pixels) > 5:  # Lọc nhiễu pixel nhỏ lẻ
-            return int(np.mean(row_pixels))
+        """
+        Tìm tâm làn đường bằng cách tách riêng biên trái và biên phải,
+        bỏ qua các vạch nằm quá sát biên ngoài cùng của ảnh (tránh ăn vào cột đèn/lề).
+        """
+        h, w = thresh_img.shape
+        mid_x = w // 2
+
+        # Cắt bỏ 10% viền mép ngoài cùng trái/phải để không ăn nhầm lề đường/cột đèn
+        margin = int(w * 0.10)
+        row = thresh_img[row_y, margin : w - margin]
+
+        # Tìm các điểm trắng trên hàng quét đã cắt margin
+        white_pts = np.where(row > 0)[0]
+        if len(white_pts) < 10:
+            return None
+
+        # Trả về tọa độ pixel thật trên ảnh
+        actual_pts = white_pts + margin
+
+        # Phân loại điểm trắng thuộc nửa trái hay nửa phải ảnh
+        left_pts = [p for p in actual_pts if p < mid_x]
+        right_pts = [p for p in actual_pts if p >= mid_x]
+
+        # Lọc nhiễu dải trắng quá rộng (như vạch ngựa vằn / chân dốc)
+        if len(actual_pts) > int(w * 0.40):
+            return None
+
+        # TH 1: Bắt được cả vạch trái và vạch phải -> Lấy trung điểm của 2 vạch (Chuẩn nhất)
+        if len(left_pts) > 0 and len(right_pts) > 0:
+            left_center = np.mean(left_pts)
+            right_center = np.mean(right_pts)
+            return int((left_center + right_center) / 2.0)
+
+        # TH 2: Chỉ thấy vạch bên phải -> Giữ khoảng cách an toàn (Offset sang trái 120px)
+        elif len(right_pts) > 0:
+            right_center = np.mean(right_pts)
+            # Không được lao thẳng vào vạch phải, phải duy trì khoảng cách an toàn
+            safe_center = right_center - 120  
+            return int(safe_center)
+
+        # TH 3: Chỉ thấy vạch bên trái -> Offset sang phải 120px
+        elif len(left_pts) > 0:
+            left_center = np.mean(left_pts)
+            safe_center = left_center + 120
+            return int(safe_center)
+
         return None
 
     def control(self):
@@ -124,116 +173,151 @@ class Starter(Node):
             self.stop()
             return
 
-        # An toàn LIDAR
+        # --------------------------------------------------------------------
+        # KHỞI TẠO BIẾN AN TOÀN TRÁNH LỖI UNASSIGNED VARIABLE
+        # --------------------------------------------------------------------
+        angular_z = 0.0
+        error = 0.0
+        now = time.time()
+
+        # Tạo ảnh hiển thị Debug bằng cv2
+        vis_img = self.image.copy()
+        h, w, _ = self.image.shape
+
+        # 1. An toàn LIDAR
         front = self.range_at(0, width_deg=30)
         if front < self.stop_distance:
             self.stop()
             self.log_every(2.0, f'Obstacle at {front:.2f}m')
+            
+            # --- CV2 IMSHOW: BƯỚC 1 (DỪNG DO VẬT CẢN) ---
+            cv2.putText(vis_img, f"STEP 1: OBSTACLE STOP ({front:.2f}m)", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.imshow("Robot Debug View", vis_img)
+            cv2.waitKey(1)
             return
 
-        h, w, _ = self.image.shape
-
-        # 1. Tiền xử lý ảnh sang nhị phân
+        # 2. Xử lý ảnh nhị phân
         gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
 
-        # 2. Định nghĩa ROI chính (1/3 dưới ảnh)
-        roi_start_y = int(h * 0.7)
-        roi_end_y = int(h * 0.95)
+        # 3. Lấy mẫu vạch ở 3 hàng quét
+        scan_rows = [int(h * 0.90), int(h * 0.80), int(h * 0.70)]
+        valid_centers = []
+        for r in scan_rows:
+            cx = self.get_line_center_at_row(thresh, r)
+            if cx is not None:
+                valid_centers.append(cx)
+                # Vẽ điểm quét lên ảnh
+                cv2.circle(vis_img, (cx, r), 5, (0, 255, 0), -1)
 
-        # Tìm trung điểm line ở 2 hàng trong ROI chính để xác định tâm và góc nghiêng
-        cx_bottom = self.get_line_center_at_row(thresh, roi_end_y)
-        cx_mid = self.get_line_center_at_row(thresh, roi_start_y)
-
-        # 3. Quét thêm 2-3 hàng phía trên ROI chính (Scanlines chống vạch ngang)
+        # 4. Kiểm tra vạch xa phía trên
         upper_scanlines_y = [int(h * 0.55), int(h * 0.45), int(h * 0.35)]
         upper_centers = [self.get_line_center_at_row(thresh, y) for y in upper_scanlines_y]
         has_line_ahead = any(c is not None for c in upper_centers)
 
-        # 4. Kiểm tra hướng góc nghiêng của line
+        # Phát hiện vạch ngang/vạch mép bị méo
         is_horizontal_line = False
-        if cx_bottom is not None and cx_mid is not None:
-            dx = cx_mid - cx_bottom
-            dy = roi_start_y - roi_end_y  # dy luôn âm
-            angle_deg = math.degrees(math.atan2(abs(dx), abs(dy)))
-            
-            # Nếu góc nghiêng > 55° so với phương dọc, nghi vấn là vạch ngang người đi bộ
-            if angle_deg > 55.0:
+        if len(valid_centers) >= 2:
+            dx = abs(valid_centers[0] - valid_centers[-1])
+            if dx > int(w * 0.35):
                 is_horizontal_line = True
 
-        # Đánh giá sự xuất hiện hợp lệ của Line
-        has_valid_current_line = (cx_bottom is not None or cx_mid is not None) and not is_horizontal_line
-
-        # 5. Bộ lọc thời gian (Temporal Filter) cho sự kiện HẾT LINE
-        if not has_valid_current_line and not has_line_ahead:
-            self.no_line_frame_count += 1
-        else:
-            # Nếu thấy line hợp lệ hoặc vẫn còn line phía trước -> Reset bộ đếm
-            self.no_line_frame_count = 0
-
-        # Kiểm tra điều kiện kích hoạt HẾT LINE
-        if self.no_line_frame_count >= self.REQUIRED_NO_LINE_FRAMES:
-            self.is_line_ended = True
+        has_valid_current_line = (len(valid_centers) > 0) and not is_horizontal_line
 
         # --------------------------------------------------------------------
-        # ĐIỀU KHIỂN ROBOT
+        # KÍCH HOẠT LEO DỐC CẦU (RAMP MODE)
         # --------------------------------------------------------------------
-        if self.is_line_ended:
-            # Xử lý khi xác nhận ĐÃ HẾT LINE THẬT SỰ
-            self.log_every(1.0, 'XÁC NHẬN: Hết line thật sự -> Dừng xe hoặc rẽ tìm line mới')
-            self.stop()
-            return
+        if not self.is_on_ramp:
+            if (not has_line_ahead or is_horizontal_line) and (0.35 < front < 0.75):
+                self.is_on_ramp = True
+                self.ramp_start_time = now
+                self.get_logger().info('>>> CHÂN CẦU: KÍCH HOẠT LEO DỐC CẦU (ÉP ĐI THẲNG)! <<<')
 
-        if is_horizontal_line or (not has_valid_current_line and has_line_ahead):
-            # Đi qua vạch người đi bộ: Giữ nguyên hướng lái, đi thẳng tiếp
-            self.log_every(1.0, 'Phát hiện vạch ngang/vạch sang đường -> Giữ thẳng tay lái')
-            self.drive(self.max_speed, 0.0)
-            return
+        # --------------------------------------------------------------------
+        # BỘ ĐIỀU KHIỂN TÍN HIỆU
+        # --------------------------------------------------------------------
+        
+        # TRƯỜNG HỢP 1: LEO CẦU (Khóa cứng bẻ lái = 0)
+        if self.is_on_ramp:
+            elapsed = now - self.ramp_start_time
+            if elapsed < 1.8:
+                self.drive(self.max_speed, 0.0)
+                self.get_logger().info(f"[RAMP MODE ACTIVE] Time={elapsed:.1f}s/1.8s | Cmd_w=0.000")
+                
+                # --- CV2 IMSHOW: BƯỚC LEO CẦU (RAMP MODE) ---
+                cv2.putText(vis_img, f"STEP: RAMP MODE ({elapsed:.1f}s/1.8s)", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.imshow("Robot Debug View", vis_img)
+                cv2.waitKey(1)
+                return
+            else:
+                self.is_on_ramp = False
+                self.get_logger().info('>>> ĐÃ VƯỢT DỐC CẦU -> CHUYỂN SANG BÁM LÀN CAMERA <<<')
 
-        # Bám làn đường bình thường
-        target_cx = cx_bottom if cx_bottom is not None else cx_mid
-        if target_cx is not None:
+        # TRƯỜNG HỢP 2: BÁM LÀN BẰNG CAMERA VỚI LỰC BẺ LÁI TỐI ƯU
+        # Trong phần TRƯỜNG HỢP 2: BÁM LÀN BẰNG CAMERA
+        if has_valid_current_line:
+            target_cx = int(np.mean(valid_centers))
             image_center = w / 2.0
             error = target_cx - image_center
-            Kp = 0.005
-            angular_z = -Kp * float(error)
+
+            if abs(error) > 250.0:
+                raw_angular = 0.0
+            elif abs(error) <= 10.0:
+                raw_angular = 0.0
+            else:
+                Kp = 0.003
+                raw_angular = -Kp * float(error)
+                
+                # KHỐNG CHẾ LỰC BẺ LÁI:
+                # Bẻ trái (raw > 0) tối đa +0.3 rad/s
+                # Bẻ phải (raw < 0) SIẾT CHẶT hơn, tối đa -0.15 rad/s để KHÔNG ĐÂM VÀO CỘT ĐÈN BÊN PHẢI
+                if raw_angular < 0:
+                    raw_angular = max(-0.15, raw_angular)  # Giới hạn góc bẻ phải
+                else:
+                    raw_angular = min(0.30, raw_angular)
+
+            # Lọc mượt Low-pass
+            alpha = 0.3
+            angular_z = alpha * raw_angular + (1.0 - alpha) * getattr(self, 'prev_angular_z', 0.0)
+            self.prev_angular_z = angular_z
+
             self.drive(self.max_speed, angular_z)
+
+            # --- CV2 IMSHOW: BƯỚC BÁM LÀN CAMERA ---
+            cv2.line(vis_img, (int(image_center), 0), (int(image_center), h), (255, 0, 0), 1)
+            cv2.line(vis_img, (target_cx, 0), (target_cx, h), (0, 255, 0), 2)
+            #cv2.putText(vis_img, status_txt, (20, 40),
+                        #cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         else:
-            # Trường hợp tạm thời mất dấu (đang trong bộ đếm N frame)
-            self.drive(self.max_speed * 0.7, 0.0)
-def catch_sigterm():
-    """Chuyển signal SIGTERM thành cờ dừng để tắt rclpy an toàn."""
-    stopping = {'now': False}
-    signal.signal(signal.SIGTERM, lambda *_: stopping.update(now=True))
-    return stopping
+            angular_z = 0.0
+            self.drive(self.max_speed * 0.8, angular_z)
 
+            # --- CV2 IMSHOW: BƯỚC MẤT LÀN (NO LINE) ---
+            cv2.putText(vis_img, "STEP: NO VALID LINE (SLOW DOWN)", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
-def spin(node, stopping):
-    """Vòng lặp spin nhận dữ liệu ROS 2 an toàn."""
-    while rclpy.ok() and not stopping['now']:
-        try:
-            rclpy.spin_once(node, timeout_sec=0.1)
-        except Exception:
-            if stopping['now'] or not rclpy.ok():
-                break
-            raise
+        # In log chẩn đoán
+        self.log_every(0.5, f"[LANE TRACKING] Ramp={self.is_on_ramp} | Error={error:.1f}px | Angular_w={angular_z:.3f}")
 
+        # --- HIỂN THỊ CỬA SỔ OPEN CV REALTIME ---
+        cv2.imshow("Robot Debug View", vis_img)
+        cv2.waitKey(1)
 
 def main(args=None):
     rclpy.init(args=args)
-    stopping = catch_sigterm()
     node = Starter()
     try:
-        spin(node, stopping)
+        rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        node.stop()
+        cv2.destroyAllWindows()  # Đóng cửa sổ cv2 khi dừng node
+        node.destroy_node()
         if rclpy.ok():
-            node.stop()
-            node.destroy_node()
-            if rclpy.ok():
-                rclpy.shutdown()
-
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
