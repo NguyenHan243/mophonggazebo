@@ -55,6 +55,7 @@ setup(
             'traffic_light = crc_sim.traffic_light_node:main',
             'pedestrian   = crc_sim.pedestrian_node:main',
             'start = crc_sim.start:main',
+            'test = crc_sim.test:main',
         ],
     },
 )
