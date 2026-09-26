@@ -1,6 +1,6 @@
 import math
-import signal
 import time
+
 import cv2
 import numpy as np
 
@@ -17,6 +17,114 @@ try:
     HAVE_CV = True
 except ImportError:
     HAVE_CV = False
+
+
+# =====================================================================
+# HẰNG SỐ DÙNG CHO NHẬN DIỆN ĐÈN GIAO THÔNG
+# (dựa theo cơ chế thật của traffic_light.py: 3 vị trí bóng cố định
+#  đỏ-trên / vàng-giữa / xanh-dưới, chỉ 1 bóng hiện ra tại 1 thời điểm)
+# =====================================================================
+LAMP_POSITION_RANGE = {
+    'RED': (0.00, 0.42),
+    'YELLOW': (0.30, 0.70),
+    'GREEN': (0.58, 1.00),
+}
+
+
+def position_to_color(box, circle):
+    """Suy ra màu đèn từ VỊ TRÍ DỌC của bóng sáng trong hộp đèn (ràng buộc cơ học)."""
+    x, y, bw, bh = box
+    cx, cy, r = circle
+    if bh <= 0:
+        return 'UNKNOWN'
+    ratio = (cy - y) / float(bh)
+    best_color, best_fit = 'UNKNOWN', None
+    for color, (lo, hi) in LAMP_POSITION_RANGE.items():
+        if lo <= ratio <= hi:
+            mid = (lo + hi) / 2.0
+            fit = abs(ratio - mid)
+            if best_fit is None or fit < best_fit:
+                best_fit, best_color = fit, color
+    return best_color
+
+
+def sample_lamp_color(img, circle):
+    """Đọc màu tại VÀNH KHUYÊN quanh bóng đèn (né vùng tâm bị cháy sáng/bloom)."""
+    cx, cy, r = circle
+    h, w, _ = img.shape
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (cx, cy), max(int(r * 0.90), 1), 255, -1)
+    cv2.circle(mask, (cx, cy), max(int(r * 0.55), 0), 0, -1)
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    ring_pixels = hsv[mask == 255]
+    if len(ring_pixels) < 5:
+        return 'UNKNOWN'
+    sat_ok = ring_pixels[ring_pixels[:, 1] > 35]
+    if len(sat_ok) < 5:
+        return 'UNKNOWN'
+
+    mean_hue = float(np.median(sat_ok[:, 0]))
+    if mean_hue < 12 or mean_hue > 170:
+        return 'RED'
+    elif 12 <= mean_hue < 35:
+        return 'YELLOW'
+    elif 40 <= mean_hue < 90:
+        return 'GREEN'
+    return 'UNKNOWN'
+
+
+# =====================================================================
+# STATE MACHINE XÁC NHẬN 1 ĐÈN GIAO THÔNG QUA CHU KỲ ĐỔI MÀU THẬT
+# (khớp config: GREEN 4-9s, YELLOW cố định 2s, RED 5-12s)
+# =====================================================================
+class TrafficLightTracker:
+    VALID_NEXT = {'GREEN': 'YELLOW', 'YELLOW': 'RED', 'RED': 'GREEN'}
+    MIN_DURATION = {'GREEN': 3.5, 'YELLOW': 1.5, 'RED': 4.5}
+    MAX_DURATION = {'GREEN': 9.5, 'YELLOW': 2.5, 'RED': 12.5}
+    CONFIRM_FRAMES = 4
+    MISS_TIMEOUT = 1.5
+
+    def __init__(self, tid):
+        self.id = tid
+        self.state = 'UNKNOWN'
+        self.state_since = time.time()
+        self.pending_color = None
+        self.confirm_count = 0
+        self.confirmed = False
+        self.last_seen = time.time()
+
+    def update(self, color, now):
+        self.last_seen = now
+        if color == self.pending_color:
+            self.confirm_count += 1
+        else:
+            self.pending_color = color
+            self.confirm_count = 1
+
+        if self.confirm_count < self.CONFIRM_FRAMES or color == self.state or color == 'UNKNOWN':
+            return self.state, self.confirmed
+
+        elapsed = now - self.state_since
+
+        if self.state == 'UNKNOWN':
+            self.state = color
+            self.state_since = now
+            return self.state, self.confirmed
+
+        expected = self.VALID_NEXT.get(self.state)
+        duration_ok = self.MIN_DURATION[self.state] <= elapsed <= self.MAX_DURATION[self.state]
+
+        if color == expected and duration_ok:
+            self.confirmed = True
+        else:
+            self.confirmed = False
+        self.state = color
+        self.state_since = now
+        return self.state, self.confirmed
+
+    def is_stale(self, now):
+        return (now - self.last_seen) > self.MISS_TIMEOUT
 
 
 class Starter(Node):
@@ -42,8 +150,8 @@ class Starter(Node):
 
         self.last_error = 0.0
         self.prev_angular_z = 0.0
-        
-        # Biến lọc nhiễu Debounce cho Cua gắt
+        self.last_outdoor_cx = None
+
         self.hard_turn_confirm = 0
 
         # --- CẤU HÌNH DỐC CẦU (RAMP) ---
@@ -51,17 +159,58 @@ class Starter(Node):
         self.ramp_start_time = None
         self.RAMP_DURATION = 3.5
 
-        # --- CẤU HÌNH HẦM (TUNNEL) & CONTINUITY TRACKING ---
+        # --- CẤU HÌNH HẦM (TUNNEL) ---
         self.is_in_tunnel = False
         self.tunnel_start_time = None
         self.TUNNEL_DURATION = 7.0
         self.last_tunnel_cx = None
+
+        # --- CẤU HÌNH VƯỢT XE (OVERTAKE) ---
+        self.overtake_state = "IDLE"
+        self.overtake_start_time = None
+        self.TIME_LANE_CHANGE = 1.8
+        self.TIME_PASSING = 2.5
+        self.TIME_RETURN_LANE = 1.8
 
         # --- WATCHDOG THOÁT BẾ TẮC ---
         self.stuck_since = None
         self.stuck_ref_dist = 0.0
         self.STUCK_TIMEOUT = 1.0
 
+        # =================================================================
+        # CẤU HÌNH BIỂN BÁO & ĐÈN GIAO THÔNG
+        # =================================================================
+        # -- Biển STOP: chờ tới vạch ngang rồi mới dừng 3s --
+        self.stop_sign_confirm = 0
+        self.stop_sign_pending = False
+        self.stop_sign_pending_since = None
+        self.is_stopped_for_sign = False
+        self.stop_sign_detected_time = None
+        self.stop_duration = 3.0
+        self.stop_sign_cooldown_until = 0.0
+        self.STOP_SIGN_COOLDOWN = 4.0
+        self.STOP_SIGN_PENDING_TIMEOUT = 6.0   # dự phòng nếu không detect được vạch
+
+        # -- Biển NO HIGHWAY: chờ tới vạch ngang rồi dừng --
+        self.no_highway_confirm = 0
+        self.no_highway_pending = False
+        self.no_highway_pending_since = None
+        self.is_stopped_for_no_highway = False
+        self.no_highway_detected_time = None
+        self.no_highway_duration = 3.0
+        self.no_highway_cooldown_until = 0.0
+        self.NO_HIGHWAY_COOLDOWN = 4.0
+        self.NO_HIGHWAY_PENDING_TIMEOUT = 6.0
+
+        self.SIGN_CONFIRM_NEEDED = 3   # số frame liên tiếp cần thấy để tin là biển thật
+
+        # -- Đèn giao thông --
+        self.light_trackers = {}       # id -> [TrafficLightTracker, (cx, cy)]
+        self.next_light_id = 0
+        self.is_light_stopped = False
+        self.has_entered_intersection = False
+        self.light_stop_start_time = None   # [MỚI] Thời điểm bắt đầu dừng đếm
+        self.light_stop_duration = 0.0
         self.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         self.bridge = CvBridge() if HAVE_CV else None
 
@@ -72,6 +221,7 @@ class Starter(Node):
 
         self.create_timer(1.0 / rate, self.tick)
 
+    # -----------------------------------------------------------------
     def on_image(self, msg):
         if self.bridge is None:
             return
@@ -88,7 +238,7 @@ class Starter(Node):
         q = msg.pose.pose.orientation
         self.x, self.y = p.x, p.y
         self.yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
-                              1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+                               1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
     def drive(self, v, w):
         msg = Twist()
@@ -116,6 +266,9 @@ class Starter(Node):
             self.get_logger().error(f'control() raised: {e}')
             self.stop()
 
+    # =====================================================================
+    # LIDAR (giữ nguyên như bản gốc)
+    # =====================================================================
     def draw_lidar_overlay(self, img, threshold_dist):
         if self.scan is None or not self.scan.ranges:
             return float('inf'), None
@@ -123,7 +276,6 @@ class Starter(Node):
         h, w, _ = img.shape
         center_x = w // 2
         center_y = int(h * 0.75)
-
         scan = self.scan
         min_dist = float('inf')
         closest_point = None
@@ -138,7 +290,6 @@ class Starter(Node):
                         pt_x = int(center_x + (angle_deg / 15.0) * (w * 0.25))
                         pt_y = int(center_y - (r / 1.5) * (h * 0.4))
                         pt_y = max(20, min(h - 10, pt_y))
-
                         if r < threshold_dist:
                             cv2.circle(img, (pt_x, pt_y), 6, (0, 0, 255), -1)
                             if r < min_dist:
@@ -146,7 +297,6 @@ class Starter(Node):
                                 closest_point = (pt_x, pt_y, angle_deg, r)
                         else:
                             cv2.circle(img, (pt_x, pt_y), 3, (0, 255, 0), -1)
-
                         if r < min_dist:
                             min_dist = r
 
@@ -155,24 +305,18 @@ class Starter(Node):
             cv2.line(img, (center_x, h - 20), (px, py), (0, 0, 255), 2)
             cv2.putText(img, f"OBSTACLE: {dist:.2f}m at {ang}deg", (px - 60, py - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
         return min_dist, closest_point
 
     def check_turn_path_clear(self, angular_z, base_half_width=15.0, max_bias_deg=28.0):
-        """Quét LiDAR theo hướng robot sắp rẽ tới (Chuyển đổi góc chuẩn ROS 2 metadata)."""
         if self.scan is None or not self.scan.ranges:
             return float('inf')
-
         scan = self.scan
         turn_ratio = max(-1.0, min(1.0, angular_z / 0.35))
         bias = max_bias_deg * turn_ratio
         half = base_half_width + abs(bias) * 0.5
-
         lo_deg = bias - half
         hi_deg = bias + half
-
         min_d = float('inf')
-
         for angle_deg in np.arange(lo_deg, hi_deg + 1.0, 2.0):
             angle_rad = math.radians(angle_deg)
             if scan.angle_min <= angle_rad <= scan.angle_max:
@@ -181,9 +325,11 @@ class Starter(Node):
                     r = scan.ranges[idx]
                     if math.isfinite(r) and r > scan.range_min:
                         min_d = min(min_d, r)
-
         return min_d
 
+    # =====================================================================
+    # BÁM LINE (giữ nguyên như bản gốc)
+    # =====================================================================
     def process_image_mask(self, img):
         h, w, _ = img.shape
         crop_h = int(h * 2 / 3)
@@ -206,7 +352,6 @@ class Starter(Node):
         side_crop = 30
         mask[:, :side_crop] = 0
         mask[:, w - side_crop:] = 0
-
         return mask, roi
 
     def largest_blob_ratio(self, mask):
@@ -227,7 +372,6 @@ class Starter(Node):
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         enhanced = self.clahe.apply(gray)
-
         _, mask = cv2.threshold(enhanced, 175, 255, cv2.THRESH_BINARY)
 
         margin = int(roi_w * 0.20)
@@ -235,7 +379,6 @@ class Starter(Node):
         mask[:, roi_w - margin:] = 0
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
         best_cx = None
         min_dist = float('inf')
         ref_x = self.last_tunnel_cx if (self.last_tunnel_cx is not None) else (roi_w / 2.0)
@@ -245,24 +388,276 @@ class Starter(Node):
             if area > 35:
                 bx, by, bw, bh = cv2.boundingRect(cnt)
                 aspect_ratio = float(bw) / float(bh) if bh > 0 else 99.0
-                
                 if aspect_ratio > 2.2:
                     continue
-
                 M = cv2.moments(cnt)
                 if M['m00'] > 0:
                     cx = int(M['m10'] / M['m00'])
                     dist = abs(cx - ref_x)
-
                     if dist < min_dist:
                         min_dist = dist
                         best_cx = cx
 
         if best_cx is not None:
             self.last_tunnel_cx = best_cx
-
         return best_cx, mask, roi
 
+    def detect_blue_car_camera(self, img):
+        h, w, _ = img.shape
+        roi = img[int(h * 0.3):int(h * 0.8), :]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        lower_blue = np.array([100, 120, 50])
+        upper_blue = np.array([140, 255, 255])
+        mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        area = cv2.countNonZero(mask)
+        total_area = roi.shape[0] * roi.shape[1]
+        score = float(area) / float(total_area)
+        has_blue_car = score > 0.035
+        return has_blue_car, score
+
+    # =====================================================================
+    # DÒ VẠCH NGANG DỪNG (stop line) - CẦN HIỆU CHỈNH NGƯỠNG SAU KHI TEST THẬT
+    # =====================================================================
+    def detect_stop_line(self, img):
+        """
+        Ý tưởng: vạch dừng/vạch qua đường phủ gần HẾT bề rộng làn đường,
+        khác với line dẫn hướng (chỉ chiếm phần giữa). Đo tỉ lệ pixel trắng
+        trên dải ảnh SÁT ĐÁY (gần robot nhất) - nếu tỉ lệ cao bất thường
+        (phủ rộng toàn bộ chiều ngang) thì coi là đã tới vạch ngang.
+        """
+        h, w, _ = img.shape
+        strip_h = max(int(h * 0.10), 6)
+        strip = img[h - strip_h:h, :]
+
+        hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+        lower_white = np.array([0, 0, 110])
+        upper_white = np.array([180, 60, 255])
+        mask = cv2.inRange(hsv, lower_white, upper_white)
+
+        side_crop = 20
+        if w > 2 * side_crop:
+            mask[:, :side_crop] = 0
+            mask[:, w - side_crop:] = 0
+
+        white_ratio = cv2.countNonZero(mask) / float(mask.shape[0] * mask.shape[1] + 1e-6)
+        # NGƯỠNG CẦN HIỆU CHỈNH: 0.35 là giá trị khởi điểm, chưa kiểm chứng
+        # với world thực tế của bạn.
+        return white_ratio > 0.35, white_ratio
+
+    # =====================================================================
+    # NHẬN DIỆN ĐÈN GIAO THÔNG
+    # =====================================================================
+    def find_traffic_light_housing(self, img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, dark_mask = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
+        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        contours, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for cnt in contours:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            if bh < 25 or bw < 10:
+                continue
+            area_ratio = cv2.contourArea(cnt) / float(bw * bh + 1e-6)
+            if area_ratio < 0.55:
+                continue
+            aspect = bh / float(bw)
+            if not (1.7 < aspect < 2.8):
+                continue
+
+            # --- Lọc biển STOP / biển hình học ---
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.035 * peri, True)   # epsilon hơi nhỏ hơn
+            if len(approx) >= 5:          # octagon / polygon → bỏ
+                continue
+
+            # Thêm: nếu vùng tối quá “đỏ” (biển STOP) thì bỏ
+            roi = img[y:y+bh, x:x+bw]
+            if roi.size > 0:
+                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                red1 = cv2.inRange(hsv, (0, 80, 50), (12, 255, 255))
+                red2 = cv2.inRange(hsv, (165, 80, 50), (180, 255, 255))
+                red_ratio = cv2.countNonZero(cv2.bitwise_or(red1, red2)) / float(bw * bh)
+                if red_ratio > 0.35:      # biển STOP đỏ chiếm phần lớn
+                    continue
+
+            boxes.append((x, y, bw, bh))
+        return boxes
+
+    def find_lamp_circle(self, img, box):
+        x, y, bw, bh = box
+        roi = img[y:y + bh, x:x + bw]
+        if roi.size == 0:
+            return None
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, bright_mask = cv2.threshold(gray_roi, 150, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        best = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(best) < 15:
+            return None
+        (cx, cy), radius = cv2.minEnclosingCircle(best)
+        if radius < 4:
+            return None
+        return (int(x + cx), int(y + cy), int(radius))
+
+    def match_or_create_light_tracker(self, box, now):
+        cx = box[0] + box[2] // 2
+        cy = box[1] + box[3] // 2
+        best_id, best_dist = None, 60.0
+        for tid, (tracker, last_center) in self.light_trackers.items():
+            d = math.hypot(cx - last_center[0], cy - last_center[1])
+            if d < best_dist:
+                best_dist, best_id = d, tid
+        if best_id is None:
+            best_id = self.next_light_id
+            self.next_light_id += 1
+            self.light_trackers[best_id] = [TrafficLightTracker(best_id), (cx, cy)]
+        else:
+            self.light_trackers[best_id][1] = (cx, cy)
+        return self.light_trackers[best_id][0]
+
+    def cleanup_stale_light_trackers(self, now):
+        stale = [tid for tid, (tr, _) in self.light_trackers.items() if tr.is_stale(now)]
+        for tid in stale:
+            del self.light_trackers[tid]
+
+    def detect_traffic_light(self, img, vis_img, now):
+        """Trả về (state, confirmed, present) của đèn LỚN NHẤT (gần nhất) trong khung hình."""
+        boxes = self.find_traffic_light_housing(img)
+        best = None  # (area, state, confirmed, box)
+        
+        for box in boxes:
+            x, y, bw, bh = box
+            circle = self.find_lamp_circle(img, box)
+            cv2.rectangle(vis_img, (x, y), (x + bw, y + bh), (255, 255, 0), 1)
+            if circle is None:
+                continue
+
+            hue_color = sample_lamp_color(img, circle)
+            pos_color = position_to_color(box, circle)
+
+            if hue_color != 'UNKNOWN' and hue_color == pos_color:
+                color = hue_color
+            elif hue_color != 'UNKNOWN' and pos_color == 'UNKNOWN':
+                color = hue_color
+            elif hue_color == 'UNKNOWN' and pos_color != 'UNKNOWN':
+                color = pos_color
+            else:
+                color = 'UNKNOWN'   # mâu thuẫn hoặc cả 2 đều không rõ -> bỏ qua frame này
+
+            tracker = self.match_or_create_light_tracker(box, now)
+            state, confirmed = tracker.update(color, now)
+
+            draw_color = {'RED': (0, 0, 255), 'YELLOW': (0, 255, 255),
+                          'GREEN': (0, 255, 0), 'UNKNOWN': (200, 200, 200)}[state]
+            cx, cy, r = circle
+            cv2.circle(vis_img, (cx, cy), r, draw_color, 2)
+            cv2.putText(vis_img, f"L{tracker.id}:{state}{'OK' if confirmed else '?'}",
+                        (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, draw_color, 1)
+
+            area = bw * bh
+            if best is None or area > best[0]:
+                best = (area, state, confirmed, box)
+
+        self.cleanup_stale_light_trackers(now)
+
+        if best is None:
+            return 'UNKNOWN', False, False
+        return best[1], best[2], True
+
+    # =====================================================================
+    # NHẬN DIỆN BIỂN BÁO: STOP (bát giác đỏ) & NO-HIGHWAY (vuông xanh lá + vạch chéo đỏ)
+    # =====================================================================
+    def classify_sign_shape(self, cnt):
+        peri = cv2.arcLength(cnt, True)
+        if peri < 30:
+            return None
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        n = len(approx)
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        aspect = bw / float(bh + 1e-6)
+        if aspect < 0.6 or aspect > 1.7:
+            return None
+        if n == 8:
+            return 'OCTAGON'
+        elif n == 4:
+            return 'SQUARE'
+        return None
+
+    def classify_sign_color(self, img, cnt):
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.drawContours(mask, [cnt], -1, 255, -1)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        pixels = hsv[mask == 255]
+        if len(pixels) < 10:
+            return 'UNKNOWN'
+        sat_ok = pixels[pixels[:, 1] > 60]
+        if len(sat_ok) < 10:
+            return 'WHITE/BLACK'
+        mean_hue = float(np.median(sat_ok[:, 0]))
+        if mean_hue < 10 or mean_hue > 170:
+            return 'RED'
+        elif 40 <= mean_hue < 85:
+            return 'GREEN'
+        return 'OTHER'
+
+    def has_diagonal_red_slash(self, img, cnt):
+        """Phân biệt 'Cấm vào cao tốc' (có vạch chéo đỏ) với 'Vào cao tốc' (không có)."""
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.drawContours(mask, [cnt], -1, 255, -1)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        red1 = cv2.inRange(hsv, (0, 100, 70), (10, 255, 255))
+        red2 = cv2.inRange(hsv, (170, 100, 70), (180, 255, 255))
+        red_mask = cv2.bitwise_or(red1, red2)
+        red_in_region = cv2.bitwise_and(red_mask, red_mask, mask=mask)
+        region_area = cv2.countNonZero(mask)
+        red_ratio = cv2.countNonZero(red_in_region) / float(region_area + 1e-6)
+        return red_ratio > 0.04
+
+    def detect_signs(self, img, vis_img):
+        """Trả về (stop_seen, no_highway_seen) cho frame hiện tại (chưa qua debounce)."""
+        stop_seen = False
+        no_highway_seen = False
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 500:
+                continue
+            shape = self.classify_sign_shape(cnt)
+            if shape is None:
+                continue
+            color = self.classify_sign_color(img, cnt)
+            x, y, bw, bh = cv2.boundingRect(cnt)
+
+            if shape == 'OCTAGON' and color == 'RED':
+                stop_seen = True
+                cv2.rectangle(vis_img, (x, y), (x + bw, y + bh), (0, 0, 255), 2)
+                cv2.putText(vis_img, "STOP", (x, y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            elif shape == 'SQUARE' and color == 'GREEN':
+                if self.has_diagonal_red_slash(img, cnt):
+                    no_highway_seen = True
+                    cv2.rectangle(vis_img, (x, y), (x + bw, y + bh), (0, 140, 255), 2)
+                    cv2.putText(vis_img, "NO HIGHWAY", (x, y - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
+                else:
+                    cv2.rectangle(vis_img, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
+                    cv2.putText(vis_img, "highway (khong dung)", (x, y - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+        return stop_seen, no_highway_seen
+
+    # =====================================================================
+    # VÒNG LẶP ĐIỀU KHIỂN CHÍNH
+    # =====================================================================
     def control(self):
         if self.image is None:
             self.stop()
@@ -272,14 +667,142 @@ class Starter(Node):
         vis_img = self.image.copy()
         h, w, _ = self.image.shape
 
+        # ================================================================
+        # 0. KIỂM TRA TRẠNG THÁI DỪNG: BỎ QUA DETECT NẾU ĐANG DỪNG
+        # ================================================================
+        is_currently_stopped = (self.is_light_stopped or 
+                                self.is_stopped_for_sign or 
+                                self.is_stopped_for_no_highway)
+
+        if is_currently_stopped:
+            # --- 1. Xử lý dừng Đèn giao thông ---
+            if self.is_light_stopped:
+                elapsed = now - getattr(self, 'light_stop_start_time', now)
+                duration = getattr(self, 'light_stop_duration', 13.0)
+
+                if elapsed < duration:
+                    self.stop()
+                    cv2.putText(vis_img, f"TRAFFIC LIGHT STOP: {duration - elapsed:.1f}s",
+                                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    cv2.imshow("Robot Debug View", vis_img)
+                    cv2.waitKey(1)
+                    return
+                else:
+                    self.is_light_stopped = False
+                    self.has_entered_intersection = True
+                    self.get_logger().info('[LIGHT] Het thoi gian dung -> Tiep tuc di qua giao lo!')
+
+            # --- 2. Xử lý dừng Biển báo STOP ---
+            elif self.is_stopped_for_sign:
+                elapsed = now - self.stop_sign_detected_time
+                if elapsed < self.stop_duration:
+                    self.stop()
+                    cv2.putText(vis_img, f"STOP SIGN: {self.stop_duration - elapsed:.1f}s",
+                                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    cv2.imshow("Robot Debug View", vis_img)
+                    cv2.waitKey(1)
+                    return
+                else:
+                    self.is_stopped_for_sign = False
+                    self.stop_sign_cooldown_until = now + self.STOP_SIGN_COOLDOWN
+
+            # --- 3. Xử lý dừng Biển báo NO HIGHWAY ---
+            elif self.is_stopped_for_no_highway:
+                elapsed = now - self.no_highway_detected_time
+                if elapsed < self.no_highway_duration:
+                    self.stop()
+                    cv2.putText(vis_img, f"NO HIGHWAY: {self.no_highway_duration - elapsed:.1f}s",
+                                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
+                    cv2.imshow("Robot Debug View", vis_img)
+                    cv2.waitKey(1)
+                    return
+                else:
+                    self.is_stopped_for_no_highway = False
+                    self.no_highway_cooldown_until = now + self.NO_HIGHWAY_COOLDOWN
+
+        # ================================================================
+        # A. NHẬN DIỆN BIỂN BÁO, ĐÈN GIAO THÔNG, VẠCH NGANG (Chỉ chạy khi CHƯA DỪNG)
+        # ================================================================
+        stop_seen, no_highway_seen = self.detect_signs(self.image, vis_img)
+        light_state, light_confirmed, light_present = self.detect_traffic_light(
+            self.image, vis_img, now)
+        at_stop_line, line_ratio = self.detect_stop_line(self.image)
+
+        # Debounce
+        # --- Debounce biển báo ---
+        self.stop_sign_confirm = (min(self.stop_sign_confirm + 1, 99) if stop_seen
+                                else max(self.stop_sign_confirm - 1, 0))
+        self.no_highway_confirm = (min(self.no_highway_confirm + 1, 99) if no_highway_seen
+                                    else max(self.no_highway_confirm - 1, 0))
+
+        stop_sign_confirmed = self.stop_sign_confirm >= self.SIGN_CONFIRM_NEEDED
+        no_highway_confirmed = self.no_highway_confirm >= self.SIGN_CONFIRM_NEEDED
+
+        # --- Ưu tiên biển báo: nếu đang xử lý STOP thì tắt light stop ---
+        sign_priority = (stop_sign_confirmed or self.stop_sign_pending or self.is_stopped_for_sign
+                        or no_highway_confirmed or self.no_highway_pending or self.is_stopped_for_no_highway)
+
+        # BIỂN BÁO: Ghi nhận "đang chờ tới vạch"
+        if (stop_sign_confirmed and not self.is_stopped_for_sign
+                and now > self.stop_sign_cooldown_until and not self.stop_sign_pending):
+            self.stop_sign_pending = True
+            self.stop_sign_pending_since = now
+            self.get_logger().info('[SIGN] Da xac nhan bien STOP - cho toi vach ngang...')
+
+        if (no_highway_confirmed and not self.is_stopped_for_no_highway
+                and now > self.no_highway_cooldown_until and not self.no_highway_pending):
+            self.no_highway_pending = True
+            self.no_highway_pending_since = now
+            self.get_logger().info('[SIGN] Da xac nhan bien NO HIGHWAY - cho toi vach ngang...')
+
+        # ĐÈN GIAO THÔNG: chỉ kích hoạt khi KHÔNG có biển báo ưu tiên
+        light_requires_stop = (not sign_priority) and light_present and light_state in ('RED', 'YELLOW') and (
+            light_confirmed or light_state == 'RED'
+        )
+
+        if not light_present and not self.is_light_stopped:
+            self.has_entered_intersection = False
+
+        if light_requires_stop and not self.is_light_stopped:
+            self.is_light_stopped = True
+            self.light_stop_start_time = now
+            self.light_stop_duration = 13.0 if light_state == 'RED' else 3.0
+            self.get_logger().info(
+                f'[LIGHT] Phat hien den {light_state}! DUNG NGAY (dem nguoc {self.light_stop_duration}s)...'
+            )
+        # ================================================================
+        # B. KÍCH HOẠT DỪNG BIỂN BÁO KHI ĐÃ TỚI VẠCH NGANG
+        # ================================================================
+        if self.stop_sign_pending:
+            timed_out = (now - self.stop_sign_pending_since) > self.STOP_SIGN_PENDING_TIMEOUT
+            if at_stop_line or timed_out:
+                self.is_stopped_for_sign = True
+                self.stop_sign_detected_time = now
+                self.stop_sign_pending = False
+                reason = "toi vach" if at_stop_line else "timeout du phong"
+                self.get_logger().info(f'[SIGN] STOP: {reason} -> dung {self.stop_duration:.1f}s')
+
+        if self.no_highway_pending:
+            timed_out = (now - self.no_highway_pending_since) > self.NO_HIGHWAY_PENDING_TIMEOUT
+            if at_stop_line or timed_out:
+                self.is_stopped_for_no_highway = True
+                self.no_highway_detected_time = now
+                self.no_highway_pending = False
+                reason = "toi vach" if at_stop_line else "timeout du phong"
+                self.get_logger().info(
+                    f'[SIGN] NO HIGHWAY: {reason} -> dung {self.no_highway_duration:.1f}s')
+
+        # Overlay thông tin debug chung
+        cv2.putText(vis_img, f"stop_line ratio={line_ratio:.2f} at_line={at_stop_line}",
+                    (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        # ================================================================
+        # PHẦN CÒN LẠI: BÁM LINE / DỐC / HẦM / VƯỢT XE / LIDAR (giữ nguyên)
+        # ================================================================
         mask_normal, roi_normal = self.process_image_mask(self.image)
         blob_ratio = self.largest_blob_ratio(mask_normal)
 
-        # --------------------------------------------------------------------
-        # 1. NHẬN BIẾT DỐC CẦU VÀ HẦM
-        # --------------------------------------------------------------------
         top_brightness = np.mean(self.image[:int(h / 3), :])
-
         is_ramp_like = (blob_ratio > 0.22)
         is_tunnel_like = (top_brightness < 65.0) and (blob_ratio > 0.18 or self.is_on_ramp)
 
@@ -300,19 +823,55 @@ class Starter(Node):
             self.is_on_ramp = False
             self.get_logger().info('>>> THOÁT DỐC CẦU <<<')
 
-        # XỬ LÝ SỰ CỐ THOÁT HẦM: Reset biến lỗi cũ để tránh bị giật bẻ lái sang trái
         if self.is_in_tunnel and (now - self.tunnel_start_time > self.TUNNEL_DURATION):
             self.is_in_tunnel = False
             self.last_tunnel_cx = None
+            self.last_outdoor_cx = None
             self.last_error = 0.0
             self.prev_angular_z = 0.0
             self.hard_turn_confirm = 0
             self.get_logger().info('>>> THOÁT HẦM: RESET ERROR & TRANSITION OUTDOOR <<<')
 
-        # --------------------------------------------------------------------
-        # 2. XỬ LÝ LIDAR CHÍNH DIỆN & WATCHDOG
-        # --------------------------------------------------------------------
         disable_lidar = self.is_on_ramp or self.is_in_tunnel
+        has_blue_car, blue_score = self.detect_blue_car_camera(self.image)
+
+        if has_blue_car and self.overtake_state == "IDLE" and not disable_lidar:
+            self.overtake_state = "LANE_CHANGE"
+            self.overtake_start_time = now
+            self.get_logger().info(">>> KÍCH HOẠT CHU TRÌNH VƯỢT XE XANH <<<")
+
+        if self.overtake_state != "IDLE":
+            elapsed = now - self.overtake_start_time
+            if self.overtake_state == "LANE_CHANGE":
+                if elapsed < self.TIME_LANE_CHANGE:
+                    self.drive(self.max_speed * 0.8, 0.35)
+                    cv2.putText(vis_img, "OVERTAKE: LATCHING LEFT", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                else:
+                    self.overtake_state = "PASSING"
+                    self.overtake_start_time = now
+            elif self.overtake_state == "PASSING":
+                if elapsed < self.TIME_PASSING:
+                    self.drive(self.max_speed, 0.0)
+                    cv2.putText(vis_img, "OVERTAKE: KEEP STRAIGHT & PASSING", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                else:
+                    self.overtake_state = "RETURN_LANE"
+                    self.overtake_start_time = now
+            elif self.overtake_state == "RETURN_LANE":
+                if elapsed < self.TIME_RETURN_LANE:
+                    self.drive(self.max_speed * 0.8, -0.30)
+                    cv2.putText(vis_img, "OVERTAKE: RETURNING TO LANE", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                else:
+                    self.overtake_state = "IDLE"
+                    self.last_outdoor_cx = None
+                    self.last_error = 0.0
+                    self.get_logger().info(">>> HOÀN THÀNH VƯỢT XE - TRỞ VỀ DÒ LINE <<<")
+
+            cv2.imshow("Robot Debug View", vis_img)
+            cv2.waitKey(1)
+            return
 
         if not disable_lidar:
             min_front_dist, closest_info = self.draw_lidar_overlay(vis_img, self.stop_distance)
@@ -350,52 +909,40 @@ class Starter(Node):
             cv2.putText(vis_img, "LIDAR IGNORED (RAMP/TUNNEL MODE)", (20, h - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-        # --------------------------------------------------------------------
-        # 3. ĐIỀU KHIỂN CHUYỂN ĐỘNG
-        # --------------------------------------------------------------------
         if self.is_in_tunnel:
             tunnel_cx, tunnel_mask, _ = self.process_tunnel_center_line(self.image)
-            
             if tunnel_cx is not None:
                 image_center = w / 2.0
                 error = tunnel_cx - image_center
-
                 Kp = 0.0050
                 Kd = 0.008
                 derivative = error - self.last_error
                 self.last_error = error
-
                 angular_z = -float(error * Kp + derivative * Kd)
                 angular_z = max(-0.45, min(0.45, angular_z))
-
                 self.drive(self.max_speed * 0.8, angular_z)
-
                 cv2.circle(vis_img, (tunnel_cx, int(h * 0.75)), 8, (255, 0, 255), -1)
-                cv2.putText(vis_img, f"TUNNEL TRACKING (cx={tunnel_cx}, err={error:.1f}px)", 
+                cv2.putText(vis_img, f"TUNNEL TRACKING (cx={tunnel_cx}, err={error:.1f}px)",
                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
             else:
                 self.drive(self.max_speed * 0.5, -0.1)
                 cv2.putText(vis_img, "TUNNEL: SEARCHING CENTER LINE", (20, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-
         else:
-            # BÁM LINE NORMAL / RAMP NGOÀI TRỜI
             M = cv2.moments(mask_normal)
             if M['m00'] > 0:
                 cx = int(M['m10'] / M['m00'])
+                self.last_outdoor_cx = cx
                 image_center = w / 2.0
                 raw_error = cx - image_center
                 abs_error = abs(raw_error)
 
-                # --- 3.1. DEBOUNCE CUA GẮT (LỌC NHIỄU NÉT ĐỨT) ---
                 if abs_error >= 60.0:
                     self.hard_turn_confirm = min(self.hard_turn_confirm + 1, 99)
                 else:
                     self.hard_turn_confirm = 0
-
                 is_confirmed_hard_turn = self.hard_turn_confirm >= 3
 
-                # --- 3.2. CẤU HÌNH THAM SỐ PID THEO CHẾ ĐỘ ---
                 if is_confirmed_hard_turn:
                     current_speed = self.max_speed * 0.55
                     Kp, Kd = 0.0055, 0.0080
@@ -405,17 +952,10 @@ class Starter(Node):
                     current_speed = self.max_speed
                     Kp, Kd = 0.0035, 0.0060
                     max_turn_limit = 0.35
+                    error = 0.0 if abs_error < 15.0 else raw_error
 
-                    # Deadzone (Dải chết): Loại bỏ hiện tượng vô-lăng nhấp nháy do nét đứt khi chạy thẳng
-                    if abs_error < 15.0:
-                        error = 0.0
-                    else:
-                        error = raw_error
-
-                # --- 3.3. TÍNH TOÁN PID & NÉ VẬT CẢN THEO LIDAR ---
                 derivative = error - self.last_error
                 self.last_error = error
-
                 raw_angular = -float(error * Kp + derivative * Kd)
                 angular_z = max(-max_turn_limit, min(max_turn_limit, raw_angular))
 
@@ -428,13 +968,11 @@ class Starter(Node):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 128, 255), 2)
 
                 self.drive(current_speed, angular_z)
-
                 cv2.circle(vis_img, (cx, int(h * 5 / 6)), 8, (0, 255, 0), -1)
                 mode_str = "HARD_TURN" if is_confirmed_hard_turn else ("RAMP" if self.is_on_ramp else "NORMAL")
                 cv2.putText(vis_img, f"TRACKING [{mode_str}] (Err={error:.1f}px, v={current_speed:.2f})",
                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             else:
-                # FALLBACK MỀM: Tiến nhanh tới trước để đón nét đứt tiếp theo thay vì xoay tại chỗ
                 fallback_w = -0.20 if self.last_error > 0 else 0.20
                 self.drive(self.max_speed * 0.6, fallback_w)
 

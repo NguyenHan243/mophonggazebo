@@ -11,6 +11,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, LaserScan
+from std_msgs.msg import String  # Thêm message String nhận tín hiệu biển báo
 
 try:
     from cv_bridge import CvBridge
@@ -38,17 +39,14 @@ class Starter(Node):
         self.image = None
         self.scan = None
         self.x = self.y = self.yaw = 0.0
-        self.pitch = 0.0  # Góc ngẩng/độ nghiêng dốc thân xe (đơn vị rad)
         self._last_log = {}
 
         self.last_error = 0.0
         self.prev_angular_z = 0.0
-        
+        self.last_outdoor_cx = None
+
         # Biến lọc nhiễu Debounce cho Cua gắt
         self.hard_turn_confirm = 0
-
-        # Tham chiếu vị trí tâm line outdoor từ frame trước
-        self.last_outdoor_cx = None
 
         # --- CẤU HÌNH DỐC CẦU (RAMP) ---
         self.is_on_ramp = False
@@ -61,6 +59,26 @@ class Starter(Node):
         self.TUNNEL_DURATION = 7.0
         self.last_tunnel_cx = None
 
+        # --- CẤU HÌNH VƯỢT XE (OVERTAKE) ---
+        self.overtake_state = "IDLE"  # Trạng thái: IDLE, LANE_CHANGE, PASSING, RETURN_LANE
+        self.overtake_start_time = None
+        self.TIME_LANE_CHANGE = 1.8  # Thời gian lách sang làn trái
+        self.TIME_PASSING = 2.5      # Thời gian giữ thẳng lái vượt qua
+        self.TIME_RETURN_LANE = 1.8  # Thời gian trả lái nhập về lại làn
+
+        # --- CẤU HÌNH BIỂN BÁO DỪNG & VẠCH DỪNG (STOP SIGN / LINE) ---
+        self.current_signal = "NONE"
+        self.stop_sign_count = 0
+        self.SIGN_CONFIRM_NEEDED = 3         # Lọc nhiễu: Cần 3 frame liên tiếp
+        self.stop_sign_pending = False
+        self.stop_sign_pending_since = 0.0
+        self.STOP_SIGN_PENDING_TIMEOUT = 5.0 # Tối đa 5s chờ đụng vạch ngang
+        self.is_stopped_for_sign = False
+        self.stop_sign_detected_time = None
+        self.STOP_DURATION = 3.0             # Thời gian dừng đúng 3 giây
+        self.stop_sign_cooldown_until = 0.0
+        self.STOP_SIGN_COOLDOWN = 10.0       # Cooldown 10s tránh nhận diện lại
+
         # --- WATCHDOG THOÁT BẾ TẮC ---
         self.stuck_since = None
         self.stuck_ref_dist = 0.0
@@ -69,12 +87,19 @@ class Starter(Node):
         self.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         self.bridge = CvBridge() if HAVE_CV else None
 
+        # --- PUBLISHERS & SUBSCRIBERS ---
         self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
         self.create_subscription(Image, '/camera/image_raw', self.on_image, qos_profile_sensor_data)
         self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)
+        
+        # Subscriber lắng nghe topic biển báo giao thông
+        self.create_subscription(String, '/traffic_signal', self.on_traffic_signal, 10)
 
         self.create_timer(1.0 / rate, self.tick)
+
+    def on_traffic_signal(self, msg):
+        self.current_signal = msg.data
 
     def on_image(self, msg):
         if self.bridge is None:
@@ -91,17 +116,8 @@ class Starter(Node):
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
         self.x, self.y = p.x, p.y
-        
-        # Tính Yaw
         self.yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
-                              1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-        
-        # Tính Pitch (Độ ngẩng thân xe - dùng để phát hiện leo dốc cầu)
-        sinp = 2.0 * (q.w * q.y - q.z * q.x)
-        if abs(sinp) >= 1:
-            self.pitch = math.copysign(math.pi / 2, sinp)
-        else:
-            self.pitch = math.asin(sinp)
+                               1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
     def drive(self, v, w):
         msg = Twist()
@@ -196,39 +212,6 @@ class Starter(Node):
 
         return min_d
 
-    def get_obstacle_avoid_bias(self, safe_dist=1.0, max_bias=0.35):
-        """Mở rộng dải quét hông từ 5 đến 60 độ mỗi bên để nhận diện cột/biển báo sát mép đường."""
-        if self.scan is None or not self.scan.ranges:
-            return 0.0
-
-        scan = self.scan
-
-        def min_in_sector(deg_min, deg_max):
-            m = float('inf')
-            for angle_deg in np.arange(deg_min, deg_max, 2.0):
-                angle_rad = math.radians(angle_deg)
-                if scan.angle_min <= angle_rad <= scan.angle_max:
-                    idx = int((angle_rad - scan.angle_min) / scan.angle_increment)
-                    if 0 <= idx < len(scan.ranges):
-                        r = scan.ranges[idx]
-                        if math.isfinite(r) and r > scan.range_min:
-                            m = min(m, r)
-            return m
-
-        left_dist = min_in_sector(5.0, 60.0)
-        right_dist = min_in_sector(-60.0, -5.0)
-
-        bias = 0.0
-        if left_dist < safe_dist:
-            push = (safe_dist - left_dist) / safe_dist
-            bias -= push * max_bias
-
-        if right_dist < safe_dist:
-            push = (safe_dist - right_dist) / safe_dist
-            bias += push * max_bias
-
-        return bias
-
     def process_image_mask(self, img):
         h, w, _ = img.shape
         crop_h = int(h * 2 / 3)
@@ -253,43 +236,6 @@ class Starter(Node):
         mask[:, w - side_crop:] = 0
 
         return mask, roi
-
-    def get_lane_cx(self, mask, roi_w, ref_x):
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best_cx = None
-        best_score = float('inf')
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 30:
-                continue
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-
-            if bw > roi_w * 0.6:
-                continue
-
-            longest_dim = max(bw, bh)
-            if longest_dim >= 12 and len(cnt) >= 5:
-                vx, vy, _, _ = cv2.fitLine(cnt, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
-                angle_from_vertical = math.degrees(math.atan2(abs(vx), abs(vy) + 1e-6))
-                
-                if angle_from_vertical > 55.0:
-                    continue
-            else:
-                aspect_ratio = float(bw) / float(bh) if bh > 0 else 99.0
-                if aspect_ratio > 3.0:
-                    continue
-
-            M = cv2.moments(cnt)
-            if M['m00'] == 0:
-                continue
-            cx = int(M['m10'] / M['m00'])
-            score = abs(cx - ref_x)
-            if score < best_score:
-                best_score = score
-                best_cx = cx
-
-        return best_cx
 
     def largest_blob_ratio(self, mask):
         total = mask.shape[0] * mask.shape[1]
@@ -327,7 +273,7 @@ class Starter(Node):
             if area > 35:
                 bx, by, bw, bh = cv2.boundingRect(cnt)
                 aspect_ratio = float(bw) / float(bh) if bh > 0 else 99.0
-                
+
                 if aspect_ratio > 2.2:
                     continue
 
@@ -345,6 +291,25 @@ class Starter(Node):
 
         return best_cx, mask, roi
 
+    def detect_blue_car_camera(self, img):
+        """Phát hiện xe màu xanh phía trước bằng Camera."""
+        h, w, _ = img.shape
+        roi = img[int(h * 0.3):int(h * 0.8), :]  # Vùng quan sát giữa màn hình
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        # Ngưỡng màu xanh dương (Blue Car)
+        lower_blue = np.array([100, 120, 50])
+        upper_blue = np.array([140, 255, 255])
+        mask = cv2.inRange(hsv, lower_blue, upper_blue)
+
+        area = cv2.countNonZero(mask)
+        total_area = roi.shape[0] * roi.shape[1]
+        score = float(area) / float(total_area)
+
+        # Nếu diện tích mảng màu xanh chiếm hơn 3.5% ROI -> Xác nhận có xe xanh
+        has_blue_car = score > 0.035
+        return has_blue_car, score
+
     def control(self):
         if self.image is None:
             self.stop()
@@ -354,23 +319,66 @@ class Starter(Node):
         vis_img = self.image.copy()
         h, w, _ = self.image.shape
 
+        # --------------------------------------------------------------------
+        # 0. XỬ LÝ LỆNH DỪNG TỪ BIỂN BÁO / VẠCH KẺ (STOP SIGN & STOP LINE)
+        # --------------------------------------------------------------------
+        sig = self.current_signal
+        at_stop_line = "+LINE" in sig
+        has_stop_sign = ("STOP_SIGN" in sig) or ("NO_HIGHWAY" in sig)
+
+        # Trạng thái 1: Đang trong quá trình dừng đủ 3 giây
+        if self.is_stopped_for_sign:
+            elapsed_stop = now - self.stop_sign_detected_time
+            if elapsed_stop < self.STOP_DURATION:
+                self.stop()
+                cv2.putText(vis_img, f"STOPPING FOR SIGN/LINE ({self.STOP_DURATION - elapsed_stop:.1f}s)",
+                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.imshow("Robot Debug View", vis_img)
+                cv2.waitKey(1)
+                return
+            else:
+                self.is_stopped_for_sign = False
+                self.stop_sign_pending = False
+                self.stop_sign_cooldown_until = now + self.STOP_SIGN_COOLDOWN
+                self.get_logger().info('>>> HOÀN THÀNH DỪNG 3s -> TIẾP TỤC HÀNH TRÌNH <<<')
+
+        # Trạng thái 2: Xác nhận sự xuất hiện của biển báo dừng (Debounce)
+        if has_stop_sign and now > self.stop_sign_cooldown_until:
+            self.stop_sign_count += 1
+        else:
+            self.stop_sign_count = max(0, self.stop_sign_count - 1)
+
+        if self.stop_sign_count >= self.SIGN_CONFIRM_NEEDED and not self.stop_sign_pending and not self.is_stopped_for_sign:
+            self.stop_sign_pending = True
+            self.stop_sign_pending_since = now
+            self.get_logger().info('[SIGN] NHẬN BIỂN BÁO STOP -> CHỜ CHẠM VẠCH NGANG DỪNG')
+
+        # Trạng thái 3: Thực hiện dừng nếu chạm Vạch kẻ ngang HOẶC hết 5 giây chờ
+        if self.stop_sign_pending:
+            pending_elapsed = now - self.stop_sign_pending_since
+            if at_stop_line or pending_elapsed > self.STOP_SIGN_PENDING_TIMEOUT:
+                self.is_stopped_for_sign = True
+                self.stop_sign_detected_time = now
+                self.stop_sign_pending = False
+                self.stop_sign_count = 0
+                self.get_logger().info('[SIGN] PHÁT HIỆN VẠCH NGANG -> DỪNG XE 3 GIÂY!')
+
         mask_normal, roi_normal = self.process_image_mask(self.image)
         blob_ratio = self.largest_blob_ratio(mask_normal)
 
         # --------------------------------------------------------------------
         # 1. NHẬN BIẾT DỐC CẦU VÀ HẦM
-        # Kết hợp Góc Pitch (IMU/Odom) + blob_ratio để nhận biết dốc cầu chuẩn xác 100%
         # --------------------------------------------------------------------
         top_brightness = np.mean(self.image[:int(h / 3), :])
 
-        is_ramp_like = (abs(self.pitch) > 0.08) or (blob_ratio > 0.20 and top_brightness > 85.0)
+        is_ramp_like = (blob_ratio > 0.22)
         is_tunnel_like = (top_brightness < 65.0) and (blob_ratio > 0.18 or self.is_on_ramp)
 
         if not self.is_on_ramp and not self.is_in_tunnel and is_ramp_like:
             self.is_on_ramp = True
             self.ramp_start_time = now
             self.stuck_since = None
-            self.get_logger().info(f'>>> KÍCH HOẠT DỐC CẦU (Pitch={self.pitch:.3f} rad, blob={blob_ratio:.2f}) <<<')
+            self.get_logger().info(f'>>> KÍCH HOẠT DỐC CẦU (blob_ratio={blob_ratio:.2f}) <<<')
 
         if not self.is_in_tunnel and is_tunnel_like:
             self.is_in_tunnel = True
@@ -383,6 +391,7 @@ class Starter(Node):
             self.is_on_ramp = False
             self.get_logger().info('>>> THOÁT DỐC CẦU <<<')
 
+        # XỬ LÝ SỰ CỐ THOÁT HẦM: Reset biến lỗi cũ để tránh bị giật bẻ lái
         if self.is_in_tunnel and (now - self.tunnel_start_time > self.TUNNEL_DURATION):
             self.is_in_tunnel = False
             self.last_tunnel_cx = None
@@ -393,10 +402,61 @@ class Starter(Node):
             self.get_logger().info('>>> THOÁT HẦM: RESET ERROR & TRANSITION OUTDOOR <<<')
 
         # --------------------------------------------------------------------
-        # 2. XỬ LÝ LIDAR CHÍNH DIỆN & WATCHDOG
+        # 2. XỬ LÝ LIDAR & NHẬN BIẾT XE XANH
         # --------------------------------------------------------------------
-        disable_lidar = self.is_on_ramp
+        disable_lidar = self.is_on_ramp or self.is_in_tunnel
+        has_blue_car, blue_score = self.detect_blue_car_camera(self.image)
 
+        # --------------------------------------------------------------------
+        # 3. MÁY TRẠNG THÁI VƯỢT XE (OVERTAKE STATE MACHINE)
+        # --------------------------------------------------------------------
+        if has_blue_car and self.overtake_state == "IDLE" and not disable_lidar:
+            self.overtake_state = "LANE_CHANGE"
+            self.overtake_start_time = now
+            self.get_logger().info(">>> KÍCH HOẠT CHU TRÌNH VƯỢT XE XANH <<<")
+
+        if self.overtake_state != "IDLE":
+            elapsed = now - self.overtake_start_time
+
+            # 3.1. Giai đoạn Lách Làn Trái
+            if self.overtake_state == "LANE_CHANGE":
+                if elapsed < self.TIME_LANE_CHANGE:
+                    self.drive(self.max_speed * 0.8, 0.35)
+                    cv2.putText(vis_img, "OVERTAKE: LATCHING LEFT", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                else:
+                    self.overtake_state = "PASSING"
+                    self.overtake_start_time = now
+
+            # 3.2. Giai đoạn Giữ Thẳng Lái để Vượt Mặt
+            elif self.overtake_state == "PASSING":
+                if elapsed < self.TIME_PASSING:
+                    self.drive(self.max_speed, 0.0)
+                    cv2.putText(vis_img, "OVERTAKE: KEEP STRAIGHT & PASSING", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                else:
+                    self.overtake_state = "RETURN_LANE"
+                    self.overtake_start_time = now
+
+            # 3.3. Giai đoạn Nhập Làn Về Lại Line
+            elif self.overtake_state == "RETURN_LANE":
+                if elapsed < self.TIME_RETURN_LANE:
+                    self.drive(self.max_speed * 0.8, -0.30)
+                    cv2.putText(vis_img, "OVERTAKE: RETURNING TO LANE", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                else:
+                    self.overtake_state = "IDLE"
+                    self.last_outdoor_cx = None
+                    self.last_error = 0.0
+                    self.get_logger().info(">>> HOÀN THÀNH VƯỢT XE - TRỞ VỀ DÒ LINE <<<")
+
+            cv2.imshow("Robot Debug View", vis_img)
+            cv2.waitKey(1)
+            return  # Tạm bỏ qua dò line khi đang chạy chu trình vượt xe
+
+        # --------------------------------------------------------------------
+        # 4. XỬ LÝ DỪNG VẬT CẢN (LIDAR) & WATCHDOG
+        # --------------------------------------------------------------------
         if not disable_lidar:
             min_front_dist, closest_info = self.draw_lidar_overlay(vis_img, self.stop_distance)
             will_stop = min_front_dist < self.stop_distance
@@ -418,6 +478,7 @@ class Starter(Node):
                 self.tunnel_start_time = now
                 self.stuck_since = None
                 will_stop = False
+                disable_lidar = True
 
             if will_stop:
                 self.stop()
@@ -429,11 +490,16 @@ class Starter(Node):
                 return
         else:
             self.stuck_since = None
-            cv2.putText(vis_img, "LIDAR IGNORED (RAMP MODE)", (20, h - 20),
+            cv2.putText(vis_img, "LIDAR IGNORED (RAMP/TUNNEL MODE)", (20, h - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
+        # Hiển thị thông báo đang chờ vạch dừng nếu có
+        if self.stop_sign_pending:
+            cv2.putText(vis_img, "STOP SIGN DETECTED: WAITING STOP LINE...", (20, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+
         # --------------------------------------------------------------------
-        # 3. ĐIỀU KHIỂN CHUYỂN ĐỘNG & TÍNH NĂNG NÉ CỘT HÔNG
+        # 5. ĐIỀU KHIỂN BÁM LINE
         # --------------------------------------------------------------------
         if self.is_in_tunnel:
             tunnel_cx, tunnel_mask, _ = self.process_tunnel_center_line(self.image)
@@ -462,18 +528,15 @@ class Starter(Node):
 
         else:
             # BÁM LINE NORMAL / RAMP NGOÀI TRỜI
-            ref_x = self.last_outdoor_cx if (self.last_outdoor_cx is not None) else (w / 2.0)
-            cx = self.get_lane_cx(mask_normal, w, ref_x)
-
-            # Lực né tránh cột bên hông
-            avoid_bias = self.get_obstacle_avoid_bias(safe_dist=1.0, max_bias=0.35) if not disable_lidar else 0.0
-
-            if cx is not None:
+            M = cv2.moments(mask_normal)
+            if M['m00'] > 0:
+                cx = int(M['m10'] / M['m00'])
                 self.last_outdoor_cx = cx
-                image_center = w / 2.0
+                image_center = w / 2.0 
                 raw_error = cx - image_center
                 abs_error = abs(raw_error)
 
+                # --- 5.1. DEBOUNCE CUA GẮT ---
                 if abs_error >= 60.0:
                     self.hard_turn_confirm = min(self.hard_turn_confirm + 1, 99)
                 else:
@@ -481,6 +544,7 @@ class Starter(Node):
 
                 is_confirmed_hard_turn = self.hard_turn_confirm >= 3
 
+                # --- 5.2. THAM SỐ PID ---
                 if is_confirmed_hard_turn:
                     current_speed = self.max_speed * 0.55
                     Kp, Kd = 0.0055, 0.0080
@@ -496,19 +560,17 @@ class Starter(Node):
                     else:
                         error = raw_error
 
+                # --- 5.3. TÍNH TOÁN PID & KIỂM TRA HƯỚNG RẼ VỚI LIDAR ---
                 derivative = error - self.last_error
                 self.last_error = error
 
                 raw_angular = -float(error * Kp + derivative * Kd)
-
-                # Cộng lực né cột hông vào góc lái
-                angular_z = raw_angular + avoid_bias
-                angular_z = max(-max_turn_limit, min(max_turn_limit, angular_z))
+                angular_z = max(-max_turn_limit, min(max_turn_limit, raw_angular))
 
                 turn_clear_dist = self.check_turn_path_clear(angular_z)
-                if turn_clear_dist < 0.32 and not disable_lidar:
+                if turn_clear_dist < 0.30 and not disable_lidar:
                     current_speed = min(current_speed, self.max_speed * 0.3)
-                    angular_z *= 0.5
+                    angular_z *= 0.6
                     self.log_every(0.5, f'[TURN GUARD] Vật cản hướng rẽ {turn_clear_dist:.2f}m -> Giảm tốc/lái')
                     cv2.putText(vis_img, f"TURN GUARD! dist={turn_clear_dist:.2f}m", (20, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 128, 255), 2)
@@ -517,13 +579,12 @@ class Starter(Node):
 
                 cv2.circle(vis_img, (cx, int(h * 5 / 6)), 8, (0, 255, 0), -1)
                 mode_str = "HARD_TURN" if is_confirmed_hard_turn else ("RAMP" if self.is_on_ramp else "NORMAL")
-                cv2.putText(vis_img, f"TRACKING [{mode_str}] (Err={error:.1f}px, avoid={avoid_bias:.2f})",
+                cv2.putText(vis_img, f"TRACKING [{mode_str}] (Err={error:.1f}px, v={current_speed:.2f})",
                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             else:
-                fallback_w = avoid_bias if abs(avoid_bias) > 0.05 else (-0.10 if self.last_error > 0 else 0.10)
+                # FALLBACK MỀM: Tiến tới trước tìm nét đứt tiếp theo
+                fallback_w = -0.20 if self.last_error > 0 else 0.20
                 self.drive(self.max_speed * 0.6, fallback_w)
-                cv2.putText(vis_img, f"LINE LOST - FALLBACK (w={fallback_w:.2f})", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
         cv2.imshow("Robot Debug View", vis_img)
         cv2.waitKey(1)

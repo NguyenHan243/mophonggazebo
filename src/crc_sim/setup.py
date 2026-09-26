@@ -56,6 +56,8 @@ setup(
             'pedestrian   = crc_sim.pedestrian_node:main',
             'bocua = crc_sim.bocua:main',
             'leocau = crc_sim.leocau:main',
+            'den = crc_sim.traffic_perception_test:main',
+            'start = crc_sim.start:main'
         ],
     },
 )
